@@ -158,9 +158,14 @@ static int apply_structural(const struct wal_record *r)
 
 	switch (r->op) {
 	case WAL_CREATE: {
-		int fd = open(bp, O_WRONLY | O_CREAT, 0644);
+		/* O_EXCL so we never reopen an existing file: the create's
+		 * intent is just "the file exists", and an existing target
+		 * (e.g. a read-only git loose object replayed after rename)
+		 * already satisfies that. Without O_EXCL, O_WRONLY on an
+		 * existing 0444 file returns EACCES and wedges the queue. */
+		int fd = open(bp, O_WRONLY | O_CREAT | O_EXCL, 0644);
 		if (fd < 0)
-			return errno;
+			return errno == EEXIST ? 0 : errno;
 		close(fd);
 		return 0;
 	}

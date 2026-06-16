@@ -123,6 +123,49 @@ wait_for "recovered modification to existing"  bcontent_eq "rewritten"  "$BACKEN
 [ "$(cat "$MNT/fresh/f.txt")" = "persist me" ] && ok "mount serves recovered file" \
 	|| no "mount serves recovered file"
 
+# ---- a replayed CREATE whose backend target already exists READ-ONLY ----
+# Reproduces the git-loose-object case: a file is created through the mount while
+# the backend is gone (CREATE queued, unsynced), the file is read-only (0444, as
+# git makes loose objects), and on recovery the backend already holds a read-only
+# file at that path (git wrote the object in a prior life). The replayed CREATE
+# must treat "already exists" as done — open(O_WRONLY) on a 0444 file is EACCES and,
+# because the file stays read-only (its own dirty-attr re-applies 0444), would wedge
+# the queue forever, blocking every op behind it. (Runs before the torn-tail test,
+# which deliberately corrupts the WAL so later structural records are unreachable.)
+status_field() { awk -F': ' -v k="$2" '$1==k{print $2}' "$1/state/status" 2>/dev/null; }
+mv "$BACKEND" "$WORK/backend.gone2"
+echo "newer content" > "$MNT/roclash"     # CREATE queued; can't sync (backend gone)
+chmod 0444 "$MNT/roclash"                  # read-only, like a git loose object
+echo "later create"  > "$MNT/after.txt"   # a LATER structural op, queued behind it
+sleep 0.5
+kill -9 "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
+fusermount3 -u "$MNT" >/dev/null 2>&1
+mv "$WORK/backend.gone2" "$BACKEND"
+mkdir -p "$BACKEND"
+printf 'stale\n' > "$BACKEND/roclash"      # backend already has it...
+chmod 0444 "$BACKEND/roclash"              # ...and it's read-only (git-style)
+rm -f "$DATA/state/status"                 # drop the pre-crash status so we don't
+                                           # race a stale "ok" before recovery runs
+if ! mount_omdfs; then
+	echo "Bail out! omdfs failed to remount (ro-create); log follows:" >&2
+	cat "$WORK/omdfs.log" >&2; exit 98
+fi
+# Wait for proof that a real recovery cycle ran (the queued content reaches the
+# backend via the dirty flush, which happens on the same cycle as the structural
+# replay) BEFORE inspecting state: the syncer publishes an initial idle "ok" for
+# the first ~700 ms after mount, so checking state right away would race it.
+wait_for "the read-only-target file's new content reaches the backend" \
+	bcontent_eq "newer content" "$BACKEND/roclash"
+wait_for "the op queued behind it also reaches the backend" \
+	bcontent_eq "later create" "$BACKEND/after.txt"
+# Now the verdict: a buggy CREATE that re-opens the 0444 file leaves state=stuck /
+# pending>0 *stably*; the idempotent create drains and settles at ok / 0.
+# (Functions, so wait_for re-reads the status each poll.)
+notstuck() { [ "$(status_field "$DATA" state)" = ok ]; }
+drained()  { [ "$(status_field "$DATA" pending-structural)" = 0 ]; }
+wait_for "read-only CREATE target does not wedge recovery (state ok)" notstuck
+wait_for "structural queue drains past the read-only create" drained
+
 # ---- a torn WAL tail (partial write at a crash) must be tolerated ----
 # Clean-unmount so the syncer drains, then append garbage to the WAL and remount:
 # the trailing record fails its length/CRC check and is discarded, not fatal.
