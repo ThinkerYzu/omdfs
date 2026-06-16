@@ -1,0 +1,151 @@
+# omdfs — Only Me Distributed File System
+
+omdfs is a FUSE filesystem that puts a size-bounded, write-back local cache in
+front of an existing network-mounted filesystem (such as sshfs or NFS). It gives
+you **local-disk speed for your working set** and **the full capacity of the
+remote store** for everything else.
+
+It is designed for one specific situation: your local disk is small, your home
+NAS is large, and accessing the NAS directly is slow — directory listings cost a
+round-trip per file, and every read hits the network even for files you just
+used. omdfs caches recently-used file contents and directory metadata locally,
+evicts cold data to stay within a budget, and writes everything back to the
+remote in the background.
+
+> **Single-writer by design.** omdfs assumes this client is the *only* writer to
+> the remote store. Other machines may read it, but must not write it. omdfs does
+> not provide cross-client consistency and does not resolve conflicts — it
+> optimizes consistency for one writing client only.
+
+## Why omdfs
+
+- **Capacity decoupling** — see the whole remote namespace through a mountpoint
+  while keeping only a bounded working set on local disk.
+- **Fast metadata** — directory listings and `stat`s for cached directories are
+  served from local disk, with no per-file round-trip to the remote.
+- **Fast warm reads** — recently-used files are read at local-disk speed.
+- **Non-blocking writes** — changes apply locally and immediately; they sync to
+  the remote in the background.
+- **Crash-safe** — un-synced writes survive a crash and are flushed on restart.
+
+## How it works
+
+omdfs sits between your applications and an already-mounted backend filesystem.
+It implements **no network protocol of its own** — it does ordinary POSIX I/O
+against the backend mount (sshfs, NFS, …).
+
+```
+        applications
+            │  POSIX syscalls
+            ▼
+   ┌──────────────────┐   mountpoint (what you see)
+   │  omdfs (FUSE)    │
+   │  ┌────────────┐  │     cache miss / build index
+   │  │ metadata    │──┼──────────────────────────────┐
+   │  │ index       │  │                               │
+   │  │ content     │  │     background write-back      │
+   │  │ cache       │──┼──────────────────────────────┤
+   │  │ journal     │  │                               ▼
+   │  └────────────┘  │   ┌─────────────────────────────────────┐
+   └──────────────────┘   │  backend: mounted network FS         │
+                          │  (sshfs / nfs / …), plain POSIX I/O   │
+   data directory:        └─────────────────────────────────────┘
+     DATADIR/
+       config           configuration
+       cache/           mirrors the backend tree (cached file contents +
+                        per-directory metadata index files)
+       journal/         write-ahead log + checkpoint
+       state/           cache size / LRU bookkeeping
+```
+
+Three things make it fast and safe:
+
+1. **Per-directory metadata index.** Each cached directory has a local-only index
+   file recording the metadata of the directory and its children. Listings and
+   stats are served from it, so a cached directory needs zero per-file round-trips
+   to the backend. The index is regenerable and is never written to the backend.
+
+2. **Whole-file cache with progressive read.** Files are cached, evicted, and
+   synced as whole files. On a miss, the whole file is fetched in the background,
+   but reads of the already-fetched portion return immediately — you can start
+   reading the head of a large file before the tail arrives.
+
+3. **Write-back with a crash-safe journal.** Structural changes
+   (create/mkdir/unlink/rmdir/rename/symlink) are recorded in an ordered
+   write-ahead log; content and attribute changes ride as dirty flags on the
+   metadata entry (so they survive renames). A background syncer applies the log
+   to the backend in order, then flushes dirty contents. Durability is provided
+   by periodic checkpoints; the journal is always recoverable after a crash.
+
+When the cache exceeds its size budget, least-recently-used **clean** whole files
+are evicted (never dirty, open, or in-flight data) and transparently re-fetched
+on next access.
+
+## Build
+
+Requires **libfuse 3** and a C11 toolchain:
+
+```bash
+# Debian / Ubuntu
+sudo apt install libfuse3-dev pkg-config build-essential
+
+make
+```
+
+## Usage
+
+```bash
+# Mount: cache the backend at /mnt/nas, store cache/journal under ~/.omdfs/data,
+# expose the filesystem at ~/nas
+omdfs --backend /mnt/nas --datadir ~/.omdfs/data ~/nas
+
+# Run in the foreground (useful while developing)
+omdfs --backend /mnt/nas --datadir ~/.omdfs/data -f ~/nas
+
+# Unmount
+fusermount3 -u ~/nas
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--backend <dir>` | the already-mounted network filesystem to cache |
+| `--datadir <dir>` | local directory for the cache, journal, and state |
+| `<mountpoint>` | where omdfs exposes the filesystem |
+
+## Tests
+
+```bash
+make test
+```
+
+`tests/run-tests.sh` mounts omdfs over a throwaway backend and asserts real
+filesystem behavior (TAP-style output), then unmounts and cleans up. It needs the
+FUSE 3 userspace tools (`fusermount3`) and permission to mount FUSE.
+
+## Limitations
+
+- **Single writer only.** Concurrent writes from other clients are unsupported
+  and may corrupt consistency.
+- **No cache-staleness detection.** The cache is trusted fully; if the backend is
+  modified out-of-band, the result is undefined. That is the user's
+  responsibility.
+- **Whole-file granularity.** A file must fit within the cache budget to be
+  cached; there is no block-level/partial caching.
+- **Hard links are not first-class** (the cache is keyed by path).
+- Linux + FUSE only.
+
+## Status
+
+Early development. Roadmap:
+
+- [x] Repository scaffold (build + argument parsing)
+- [x] Phase 1 — mount skeleton (read-only passthrough to the backend)
+- [x] Phase 2 — per-directory metadata index for reads
+- [x] Phase 3 — content cache + progressive read
+- [x] Phase 4 — write-back (journal + background syncer) + crash recovery
+- [ ] Phase 5 — eviction (bounded cache)
+- [ ] Phase 6 — hardening (config, status/diagnostics, clean unmount)
+
+## License
+
+TBD.

@@ -1,0 +1,8 @@
+# Build artifacts
+*.o
+*.d
+/omdfs
+
+# Editor / OS
+*.swp
+.DS_Store
