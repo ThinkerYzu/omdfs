@@ -14,6 +14,7 @@ struct omdfs_config {
 	char *backend; /* BACKEND_ROOT — the network mount (no trailing slash) */
 	char *datadir; /* DATADIR — cache + journal + state (no trailing slash) */
 	off_t cache_budget; /* cache size limit in bytes; 0 = unlimited (no eviction) */
+	int resync; /* --resync: reconcile cache → backend, then exit (no mount) */
 };
 
 extern struct omdfs_config g_cfg;

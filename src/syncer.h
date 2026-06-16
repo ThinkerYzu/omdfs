@@ -26,4 +26,12 @@ void syncer_kick(void);
 /* Signal the thread to stop, run a final drain, and join it. */
 void syncer_stop(void);
 
+/* One-shot offline reconcile (the --resync tool): drain the structural WAL, then
+ * walk the whole cached tree and force every entry's existence + content + attrs
+ * onto the backend regardless of dirty flags, making the backend match the cache.
+ * Does NOT start the background thread; intended to run on an unmounted datadir.
+ * Returns 0 if everything was pushed, 1 if any entry failed or a structural op is
+ * blocked (a summary is printed to stderr). */
+int syncer_resync(void);
+
 #endif /* OMDFS_SYNCER_H */

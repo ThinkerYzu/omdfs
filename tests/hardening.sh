@@ -15,6 +15,9 @@
 #   E. config file   — --config supplies backend/datadir/cache-size from a file.
 #   F. clean unmount — a clean fusermount3 -u fully drains pending writes to the
 #                      backend (final-drain), leaving an idle status.
+#   G. resync        — the offline `--resync` tool force-reconciles the whole cache
+#                      (content + metadata + namespace) onto the backend, even over
+#                      a read-only existing target, after a crash left work unsynced.
 #
 # Usage: tests/hardening.sh [path-to-omdfs-binary]   (default: ./omdfs)
 
@@ -233,6 +236,57 @@ fpend="$(status_field "$F/data" pending-structural)"
 [ "$fstate" = ok ] && [ "$fpend" = 0 ] \
 	&& ok "post-unmount status is idle (state ok, 0 pending)" \
 	|| no "post-unmount status is idle (state '$fstate', pending '$fpend')"
+
+# ============================================================
+# G. --resync force-reconciles the cache onto the backend
+# ============================================================
+# Build a tree online, prime the cache, then take the backend away and make a
+# spread of offline changes (modify, create, mkdir, symlink, chmod) that can't
+# sync. Crash (kill -9) so nothing drains, restore the backend, mark an existing
+# target read-only (the stuck-class case), and run the offline tool. The backend
+# must end up matching the cache.
+G="$WORK/g"; mkdir -p "$G/backend/sub" "$G/data" "$G/mnt"
+printf 'orig-inner\n' > "$G/backend/sub/inner.txt"
+printf 'orig-top\n'   > "$G/backend/top.txt"
+if ! mount_omdfs "$G/mnt" "$G/omdfs.log" --backend "$G/backend" --datadir "$G/data"; then
+	echo "Bail out! omdfs failed to mount (G); log follows:" >&2; cat "$G/omdfs.log" >&2; exit 98
+fi
+gpid="$PID"
+cat "$G/mnt/sub/inner.txt" >/dev/null; cat "$G/mnt/top.txt" >/dev/null   # cache content
+ls "$G/mnt" "$G/mnt/sub" >/dev/null                                       # build indexes
+mv "$G/backend" "$G/backend.gone"                                         # backend offline
+echo "NEW inner"  > "$G/mnt/sub/inner.txt"     # modify existing (dirty content)
+echo "brand new"  > "$G/mnt/sub/created.txt"   # new file...
+chmod 0600 "$G/mnt/sub/created.txt"            # ...with a custom mode
+mkdir "$G/mnt/newdir"                          # new dir
+echo deep > "$G/mnt/newdir/deep.txt"           # new nested file
+ln -s targetpath "$G/mnt/sub/alink"            # new symlink
+chmod 0640 "$G/mnt/top.txt"                    # dirty attr on an existing file
+sleep 0.3
+kill -9 "$gpid" 2>/dev/null; wait "$gpid" 2>/dev/null
+fusermount3 -u "$G/mnt" >/dev/null 2>&1
+mv "$G/backend.gone" "$G/backend"              # backend returns
+chmod 0444 "$G/backend/top.txt"                # existing target read-only (stuck-class)
+"$OMDFS" --resync --backend "$G/backend" --datadir "$G/data" >"$G/resync.log" 2>&1 \
+	&& ok "resync exits clean (0 failures)" \
+	|| { no "resync exits clean (0 failures)"; cat "$G/resync.log" >&2; }
+[ "$(cat "$G/backend/sub/inner.txt" 2>/dev/null)" = "NEW inner" ] \
+	&& ok "resync pushes a modified file's content" \
+	|| no "resync pushes a modified file's content"
+[ "$(cat "$G/backend/sub/created.txt" 2>/dev/null)" = "brand new" ] \
+	&& [ "$(stat -c %a "$G/backend/sub/created.txt" 2>/dev/null)" = 600 ] \
+	&& ok "resync pushes a new file with its mode" \
+	|| no "resync pushes a new file with its mode"
+[ "$(cat "$G/backend/newdir/deep.txt" 2>/dev/null)" = deep ] \
+	&& ok "resync pushes a new directory and its contents" \
+	|| no "resync pushes a new directory and its contents"
+[ "$(readlink "$G/backend/sub/alink" 2>/dev/null)" = targetpath ] \
+	&& ok "resync pushes a new symlink" \
+	|| no "resync pushes a new symlink"
+[ "$(cat "$G/backend/top.txt" 2>/dev/null)" = "orig-top" ] \
+	&& [ "$(stat -c %a "$G/backend/top.txt" 2>/dev/null)" = 640 ] \
+	&& ok "resync reconciles a read-only backend target (content + mode)" \
+	|| no "resync reconciles a read-only backend target (content + mode)"
 
 # ---- summary ----
 echo "1..$COUNT"

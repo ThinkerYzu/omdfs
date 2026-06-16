@@ -518,16 +518,20 @@ static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"usage: %s [--config <file>] --backend <dir> --datadir <dir> [--cache-size <bytes>] [fuse-opts] <mountpoint>\n"
+		"       %s --resync [--config <file>] --backend <dir> --datadir <dir>\n"
 		"\n"
 		"  --config <file>     read backend/datadir/cache-size from a key=value file\n"
 		"  --backend <dir>     already-mounted network FS to cache (sshfs/nfs/...)\n"
 		"  --datadir <dir>     local cache/journal/state directory\n"
 		"  --cache-size <sz>   cache budget; accepts K/M/G suffix (0 = unlimited)\n"
+		"  --resync            push the whole cache (content + metadata) to the\n"
+		"                      backend so it matches the cache, then exit; no mount.\n"
+		"                      Run while unmounted. Reports a summary on stderr.\n"
 		"  <mountpoint>        where omdfs is exposed\n"
 		"\n"
 		"Command-line options override values from --config. While mounted, the\n"
 		"daemon publishes sync progress to <datadir>/state/status.\n",
-		prog);
+		prog, prog);
 }
 
 /* Parse a size like "100", "64K", "512M", "2G" (1024-based). Returns the byte
@@ -663,7 +667,9 @@ static int parse_args(int argc, char **argv, int *out_argc, char **out_argv)
 				return -1;
 			}
 			g_cfg.cache_budget = sz;
-		} else
+		} else if (!strcmp(argv[i], "--resync"))
+			g_cfg.resync = 1;
+		else
 			out_argv[oc++] = argv[i];
 	}
 	out_argv[oc] = NULL;
@@ -714,6 +720,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "omdfs: cannot initialize journal\n");
 		free(fuse_argv);
 		return 1;
+	}
+	/* --resync: one-shot reconcile of the cache onto the backend, then exit.
+	 * Run while unmounted so the live syncer isn't writing the backend too. */
+	if (g_cfg.resync) {
+		int rc = syncer_resync();
+		free(fuse_argv);
+		return rc;
 	}
 	/* Seed the cache-size accounting from content already on disk and arm the
 	 * evictor (no-op when --cache-size is 0/unset). */

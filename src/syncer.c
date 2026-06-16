@@ -105,13 +105,18 @@ static int copy_file(const char *src, const char *dst)
 }
 
 /* Best-effort apply of a (file/dir) entry's logical attributes to the backend. */
+static void apply_stat_attrs(const char *bp, const struct stat *s)
+{
+	int ignored = chmod(bp, s->st_mode & 07777);
+	ignored = chown(bp, s->st_uid, s->st_gid); /* needs privilege */
+	(void)ignored;
+	struct timespec ts[2] = { s->st_atim, s->st_mtim };
+	utimensat(AT_FDCWD, bp, ts, 0);
+}
+
 static void apply_attrs(const char *bp, const struct omdfs_entry *e)
 {
-	int ignored = chmod(bp, e->st.st_mode & 07777);
-	ignored = chown(bp, e->st.st_uid, e->st.st_gid); /* needs privilege */
-	(void)ignored;
-	struct timespec ts[2] = { e->st.st_atim, e->st.st_mtim };
-	utimensat(AT_FDCWD, bp, ts, 0);
+	apply_stat_attrs(bp, &e->st);
 }
 
 /* ---- phase 1: structural drain ---- */
@@ -327,6 +332,122 @@ static void flush_pending(struct omdfs_status *st)
 			dirtyset_add(dirs[i]); /* still dirty: retry next cycle */
 	}
 	dirtyset_free(dirs, n);
+}
+
+/* ---- full resync (operator-triggered reconcile) ---- */
+
+struct resync_stats {
+	long dirs, files, links, meta_only;
+	long long bytes;
+	int failed;
+};
+
+/* Push one entry to the backend unconditionally (existence + content + attrs),
+ * ignoring dirty flags. Used by the offline --resync reconcile, not the cycle. */
+static void resync_entry(const char *fuse_dir, const struct omdfs_entry *e,
+			 struct resync_stats *rs)
+{
+	char fpath[PATH_MAX], bp[PATH_MAX];
+	join_path(fpath, fuse_dir, e->name);
+	backend_path(bp, fpath);
+
+	if (e->type == OMDFS_T_DIR) {
+		if (mkdir(bp, e->st.st_mode & 07777) != 0 && errno != EEXIST) {
+			rs->failed++;
+			return;
+		}
+		apply_stat_attrs(bp, &e->st);
+		rs->dirs++;
+		return;
+	}
+	if (e->type == OMDFS_T_LINK) {
+		if (!e->link)
+			return;
+		unlink(bp); /* re-point an existing link; symlink() can't replace */
+		if (symlink(e->link, bp) != 0) {
+			rs->failed++;
+			return;
+		}
+		rs->links++;
+		return;
+	}
+	/* regular file */
+	if (e->flags & OMDFS_F_CONTENT_CACHED) {
+		char cp[PATH_MAX];
+		cache_path(cp, fpath);
+		if (copy_file(cp, bp) != 0) { /* tmp + rename: replaces a 0444 file */
+			rs->failed++;
+			return;
+		}
+		apply_stat_attrs(bp, &e->st);
+		rs->files++;
+		rs->bytes += (long long)e->st.st_size;
+	} else {
+		/* Content was never fetched into the cache, so the cache has no
+		 * bytes to push — don't clobber whatever is on the backend. Just
+		 * ensure the file exists and reconcile its attrs. O_RDONLY|O_CREAT
+		 * never re-opens an existing (possibly read-only) file for write. */
+		int fd = open(bp, O_RDONLY | O_CREAT, e->st.st_mode & 07777);
+		if (fd < 0) {
+			rs->failed++;
+			return;
+		}
+		close(fd);
+		apply_stat_attrs(bp, &e->st);
+		rs->meta_only++;
+	}
+}
+
+/* Recursively force every cached entry under `fuse_dir` onto the backend. */
+static void resync_tree(const char *fuse_dir, struct resync_stats *rs)
+{
+	struct omdfs_index idx;
+	if (meta_try_load(fuse_dir, &idx) != 0)
+		return; /* not a cached directory */
+
+	/* The directory itself: ensure it exists with its own attrs. */
+	char bp[PATH_MAX];
+	backend_path(bp, fuse_dir);
+	if (mkdir(bp, idx.dir_st.st_mode & 07777) != 0 && errno != EEXIST)
+		rs->failed++;
+	apply_stat_attrs(bp, &idx.dir_st);
+
+	for (size_t i = 0; i < idx.n; i++) {
+		struct omdfs_entry *e = &idx.entries[i];
+		resync_entry(fuse_dir, e, rs);
+		if (e->type == OMDFS_T_DIR) {
+			char child[PATH_MAX];
+			join_path(child, fuse_dir, e->name);
+			resync_tree(child, rs);
+		}
+	}
+	meta_free_index(&idx);
+}
+
+int syncer_resync(void)
+{
+	/* Drain the structural WAL first so pending deletes/renames apply before
+	 * we re-assert existence from the cache. Best-effort: a stuck op is
+	 * reported but we still push content/attrs for everything present. */
+	struct omdfs_status st;
+	memset(&st, 0, sizeof(st));
+	phase_structural(&st);
+
+	struct resync_stats rs;
+	memset(&rs, 0, sizeof(rs));
+	resync_tree("/", &rs);
+
+	fprintf(stderr,
+		"omdfs: resync pushed %ld dirs, %ld files (%lld bytes), "
+		"%ld symlinks; %ld files metadata-only (content not cached); "
+		"%d failed\n",
+		rs.dirs, rs.files, rs.bytes, rs.links, rs.meta_only, rs.failed);
+	if (st.stuck_errno)
+		fprintf(stderr,
+			"omdfs: warning: a structural op is blocked (%s %s, "
+			"errno %d) — some namespace changes may not have applied\n",
+			st.stuck_op, st.stuck_path, st.stuck_errno);
+	return (rs.failed == 0 && !st.stuck_errno) ? 0 : 1;
 }
 
 /* ---- cycle + thread ---- */
