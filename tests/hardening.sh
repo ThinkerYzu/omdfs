@@ -18,6 +18,11 @@
 #   G. resync        — the offline `--resync` tool force-reconciles the whole cache
 #                      (content + metadata + namespace) onto the backend, even over
 #                      a read-only existing target, after a crash left work unsynced.
+#   H. live resync   — on a *running* mount, creating DATADIR/state/resync makes the
+#                      syncer thread run the same reconcile: a clean cached file whose
+#                      backend copy drifted (something the normal syncer never re-pushes)
+#                      is forced back to the cache, the trigger is consumed once, and the
+#                      result is surfaced in the status file.
 #
 # Usage: tests/hardening.sh [path-to-omdfs-binary]   (default: ./omdfs)
 
@@ -287,6 +292,36 @@ chmod 0444 "$G/backend/top.txt"                # existing target read-only (stuc
 	&& [ "$(stat -c %a "$G/backend/top.txt" 2>/dev/null)" = 640 ] \
 	&& ok "resync reconciles a read-only backend target (content + mode)" \
 	|| no "resync reconciles a read-only backend target (content + mode)"
+
+# ============================================================
+# H. live resync trigger reconciles a running mount
+# ============================================================
+# A clean (non-dirty) cached file whose backend copy drifts out-of-band is never
+# re-pushed by the normal syncer (nothing marks it dirty). An operator triggers a
+# reconcile on the running mount by creating state/resync; the syncer thread runs
+# the full reconcile on its own thread and force-pushes the cache onto the backend.
+H="$WORK/h"; mkdir -p "$H/backend" "$H/data" "$H/mnt"
+printf 'cache-truth\n' > "$H/backend/drift.txt"
+if ! mount_omdfs "$H/mnt" "$H/omdfs.log" --backend "$H/backend" --datadir "$H/data"; then
+	echo "Bail out! omdfs failed to mount (H); log follows:" >&2; cat "$H/omdfs.log" >&2; exit 98
+fi
+cat "$H/mnt/drift.txt" >/dev/null              # prime the cache (CONTENT_CACHED, clean)
+ls "$H/mnt" >/dev/null                          # build the index
+sleep 0.5                                        # let the background fetch finalize
+printf 'BACKEND DRIFTED\n' > "$H/backend/drift.txt"   # out-of-band change to the backend
+sleep 2                                          # a couple of normal sync cycles
+[ "$(cat "$H/backend/drift.txt")" = "BACKEND DRIFTED" ] \
+	&& ok "normal sync leaves a clean file's backend drift untouched" \
+	|| no "normal sync leaves a clean file's backend drift untouched"
+touch "$H/data/state/resync"                     # operator triggers a live reconcile
+hreconciled() { [ "$(cat "$H/backend/drift.txt" 2>/dev/null)" = "cache-truth" ]; }
+wait_for "live resync reconciles the drifted backend file to the cache" hreconciled
+htrigger_gone() { [ ! -e "$H/data/state/resync" ]; }
+wait_for "live resync consumes the trigger file (one-shot)" htrigger_gone
+hres="$(status_field "$H/data" last-resync-result)"
+{ [ -n "$hres" ] && [ "$hres" != "-" ]; } \
+	&& ok "status reports the last-resync result ($hres)" \
+	|| no "status reports the last-resync result (got '$hres')"
 
 # ---- summary ----
 echo "1..$COUNT"

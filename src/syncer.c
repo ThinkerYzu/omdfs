@@ -424,18 +424,28 @@ static void resync_tree(const char *fuse_dir, struct resync_stats *rs)
 	meta_free_index(&idx);
 }
 
-int syncer_resync(void)
+/* Drain the structural WAL, then force the whole cached tree onto the backend.
+ * Shared by the offline --resync tool and the live (operator-triggered)
+ * reconcile. Fills *rs with per-entry stats and *blk with any blocked structural
+ * op (only stuck_* fields are meaningful). Must run with no other thread writing
+ * the backend — offline, or on the syncer thread itself. */
+static void resync_reconcile(struct resync_stats *rs, struct omdfs_status *blk)
 {
 	/* Drain the structural WAL first so pending deletes/renames apply before
 	 * we re-assert existence from the cache. Best-effort: a stuck op is
 	 * reported but we still push content/attrs for everything present. */
-	struct omdfs_status st;
-	memset(&st, 0, sizeof(st));
-	phase_structural(&st);
+	memset(blk, 0, sizeof(*blk));
+	phase_structural(blk);
 
+	memset(rs, 0, sizeof(*rs));
+	resync_tree("/", rs);
+}
+
+int syncer_resync(void)
+{
+	struct omdfs_status st;
 	struct resync_stats rs;
-	memset(&rs, 0, sizeof(rs));
-	resync_tree("/", &rs);
+	resync_reconcile(&rs, &st);
 
 	fprintf(stderr,
 		"omdfs: resync pushed %ld dirs, %ld files (%lld bytes), "
@@ -450,6 +460,44 @@ int syncer_resync(void)
 	return (rs.failed == 0 && !st.stuck_errno) ? 0 : 1;
 }
 
+/* ---- live (operator-triggered) resync ---- */
+
+/* Result of the most recent live resync, carried into every status snapshot so
+ * an operator can confirm a triggered repair ran. Touched only on the syncer
+ * thread (in sync_once), so no locking is needed. */
+static long long s_last_resync_epoch;
+static char s_last_resync[256];
+
+/* An operator requests a live reconcile by creating DATADIR/state/resync (e.g.
+ * `touch <datadir>/state/resync`). The syncer thread consumes it at the top of a
+ * cycle: the unlink both tests for and claims the trigger in one step, so it
+ * fires exactly once. The reconcile then runs on this thread — never concurrently
+ * with the normal drain or another reconcile — which is why no extra signal
+ * handler or backend locking is needed. Picked up within one sync interval. */
+static void maybe_live_resync(void)
+{
+	char tp[PATH_MAX];
+	snprintf(tp, sizeof(tp), "%s/state/resync", g_cfg.datadir);
+	if (unlink(tp) != 0)
+		return; /* ENOENT (no request) or unremovable: nothing to do */
+
+	struct omdfs_status blk;
+	struct resync_stats rs;
+	resync_reconcile(&rs, &blk);
+
+	s_last_resync_epoch = (long long)time(NULL);
+	int n = snprintf(s_last_resync, sizeof(s_last_resync),
+			 "%ld dirs, %ld files (%lld bytes), %ld symlinks, "
+			 "%ld meta-only, %d failed",
+			 rs.dirs, rs.files, rs.bytes, rs.links, rs.meta_only,
+			 rs.failed);
+	/* A blocked structural op is also reported via the cycle's stuck-* lines
+	 * (with the full path); here we just note it happened. */
+	if (blk.stuck_errno && n > 0 && n < (int)sizeof(s_last_resync))
+		snprintf(s_last_resync + n, sizeof(s_last_resync) - (size_t)n,
+			 "; structural op blocked (errno %d)", blk.stuck_errno);
+}
+
 /* ---- cycle + thread ---- */
 
 /* Run one full sync cycle and fill `st` with the resulting backlog/health so the
@@ -457,6 +505,8 @@ int syncer_resync(void)
 static void sync_once(struct omdfs_status *st)
 {
 	memset(st, 0, sizeof(*st));
+
+	maybe_live_resync(); /* operator-triggered full reconcile, on this thread */
 
 	phase_structural(st); /* backend dirs/files exist before content flush */
 	flush_pending(st);
@@ -474,6 +524,10 @@ static void sync_once(struct omdfs_status *st)
 	if (!st->pending_structural && !st->dirty_files && !st->stuck_errno)
 		s_last_clean = (long long)time(NULL);
 	st->last_sync_epoch = s_last_clean;
+
+	/* Carry the most recent live-resync result so it stays visible in status. */
+	st->last_resync_epoch = s_last_resync_epoch;
+	snprintf(st->last_resync, sizeof(st->last_resync), "%s", s_last_resync);
 }
 
 static void *syncer_loop(void *arg)

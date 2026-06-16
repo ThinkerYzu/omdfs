@@ -32,6 +32,8 @@ struct omdfs_status {
 	char stuck_op[16];         /* op name of the stuck/blocked op ("" if none) */
 	char stuck_path[PATH_MAX]; /* path of the stuck/blocked op ("" if none) */
 	long long last_sync_epoch; /* CLOCK_REALTIME secs of the last clean cycle (0 = never) */
+	long long last_resync_epoch; /* secs of the last operator-triggered resync (0 = never) */
+	char last_resync[256];     /* one-line summary of that resync ("" = never run) */
 };
 
 /* Record the daemon start and write an initial "starting" status file. Call once

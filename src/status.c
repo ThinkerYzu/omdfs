@@ -65,11 +65,13 @@ static int write_all(int fd, const void *buf, size_t len)
 
 void status_publish(const struct omdfs_status *s)
 {
-	char now_s[32], last_s[32], started_s[32];
+	char now_s[32], last_s[32], started_s[32], resync_s[32];
 	long long now = (long long)time(NULL);
 	fmt_time(now, now_s);
 	fmt_time(s->last_sync_epoch, last_s);
 	fmt_time((long long)g_started, started_s);
+	fmt_time(s->last_resync_epoch, resync_s);
+	const char *resync_res = (s->last_resync[0]) ? s->last_resync : "-";
 
 	const char *stuck_op = (s->stuck_op[0]) ? s->stuck_op : "-";
 	const char *stuck_path = (s->stuck_path[0]) ? s->stuck_path : "-";
@@ -97,13 +99,15 @@ void status_publish(const struct omdfs_status *s)
 		"stuck: %s\n"
 		"stuck-op: %s\n"
 		"stuck-path: %s\n"
-		"stuck-errno: %s\n",
+		"stuck-errno: %s\n"
+		"last-resync: %s\n"
+		"last-resync-result: %s\n",
 		overall(s), now_s, started_s, last_s,
 		s->pending_structural, s->dirty_files, s->dirty_bytes,
 		s->cache_bytes, s->cache_budget, s->cache_hard_limit,
 		s->backpressure ? "yes" : "no",
 		s->stuck ? "yes" : "no",
-		stuck_op, stuck_path, errbuf);
+		stuck_op, stuck_path, errbuf, resync_s, resync_res);
 	if (len < 0)
 		return;
 	if (len > (int)sizeof(body))

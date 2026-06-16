@@ -112,6 +112,25 @@ fusermount3 -u ~/nas
 | `--datadir <dir>` | local directory for the cache, journal, and state |
 | `<mountpoint>` | where omdfs exposes the filesystem |
 
+### Forcing a resync
+
+If the cache and backend drift, reconcile the whole cache onto the backend
+(force-push every cached entry's existence, content, and attributes regardless of
+dirty flags):
+
+```bash
+# offline — run while UNMOUNTED so the live syncer isn't also writing the backend
+omdfs --resync --backend /mnt/nas --datadir ~/.omdfs/data
+
+# live — on a running mount, trigger the same reconcile on the syncer thread:
+touch ~/.omdfs/data/state/resync
+```
+
+The live trigger is one-shot: the syncer thread consumes the file within one sync
+interval, runs the reconcile on its own thread (never concurrently with the live
+drain), and reports the outcome in `state/status` (`last-resync`,
+`last-resync-result`).
+
 ## Tests
 
 ```bash

@@ -31,7 +31,13 @@ void syncer_stop(void);
  * onto the backend regardless of dirty flags, making the backend match the cache.
  * Does NOT start the background thread; intended to run on an unmounted datadir.
  * Returns 0 if everything was pushed, 1 if any entry failed or a structural op is
- * blocked (a summary is printed to stderr). */
+ * blocked (a summary is printed to stderr).
+ *
+ * A *running* mount runs the same reconcile when an operator creates the trigger
+ * file DATADIR/state/resync (e.g. `touch <datadir>/state/resync`): the syncer
+ * thread consumes it within one sync interval and runs the reconcile on its own
+ * thread (never concurrently with the live drain), reporting the result in the
+ * status file's last-resync / last-resync-result lines. */
 int syncer_resync(void);
 
 #endif /* OMDFS_SYNCER_H */
