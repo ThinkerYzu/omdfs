@@ -290,6 +290,15 @@ wait_for "dirty file under renamed dir reaches new backend path" \
 	bcontent_eq "deep dirty" "$BACKEND/dd2/sub/f.txt"
 wait_for "renamed-away source dir is gone from backend" bgone "$BACKEND/dd"
 
+# --- root getattr is served from the local index, not the backend ---
+# stat($MNT) (path "/") must answer from the cached root index (its dir_st, the
+# same value readdir fills for "."), so the mount root remains stat-able with the
+# backend gone — consistent with every other path. Regression for the old quirk
+# where omdfs_getattr("/") did an unconditional backend lstat.
+mv "$BACKEND" "$WORK/backend.gone2"
+assert_success "root getattr served locally with backend gone" stat "$MNT"
+mv "$WORK/backend.gone2" "$BACKEND"
+
 # ---- summary ----
 echo "1..$COUNT"
 if [ "$FAIL" -ne 0 ]; then

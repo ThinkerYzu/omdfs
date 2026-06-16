@@ -121,9 +121,18 @@ static int omdfs_getattr(const char *path, struct stat *st,
 	(void)fi;
 
 	if (path[0] == '/' && path[1] == '\0') {
-		char bp[PATH_MAX];
-		backend_path(bp, path);
-		return lstat(bp, st) == 0 ? 0 : -errno;
+		/* Serve the root's own attributes from the local index (its
+		 * dir_st, same value readdir fills for "."). meta_get_index
+		 * loads the persisted .omdfs.dir first and only falls back to
+		 * the backend on a miss, so a cached root works with the
+		 * backend gone — consistent with every other path. */
+		struct omdfs_index idx;
+		int r = meta_get_index("/", &idx);
+		if (r != 0)
+			return r;
+		*st = idx.dir_st;
+		meta_free_index(&idx);
+		return 0;
 	}
 
 	char parent[PATH_MAX], name[PATH_MAX];
