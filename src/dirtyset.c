@@ -71,6 +71,13 @@ void dirtyset_add(const char *fuse_dir)
 	pthread_mutex_unlock(&g_lock);
 }
 
+void dirtyset_force_full(void)
+{
+	pthread_mutex_lock(&g_lock);
+	g_force_full = 1;
+	pthread_mutex_unlock(&g_lock);
+}
+
 void dirtyset_rename(const char *from, const char *to)
 {
 	size_t flen = strlen(from), tlen = strlen(to);

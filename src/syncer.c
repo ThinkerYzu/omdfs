@@ -70,6 +70,33 @@ static long long activity_idle_ms(void)
 	return mono_ms() - last;
 }
 
+/* Set for the duration of the clean-unmount drain so neither the syncer cycle nor
+ * the pool workers back off — the drain must push everything out before we exit. */
+static atomic_int s_final_drain;
+
+/* Should background sync work yield to the foreground right now? True only when we
+ * are actively contending: the backoff is enabled, a FUSE op happened recently, and
+ * we are not under backpressure (a near-full cache must drain promptly) nor in the
+ * final drain. Used both by the flush producer (to dry-count and stop the walk when
+ * the pool queue fills) and by each pool worker (to pause before the next copy).
+ *
+ * The "recently active" window is s_backoff_ms (the operator's favor-the-foreground
+ * knob, default 2 s), NOT the 250 ms ACTIVITY_QUIET_MS used by the top-of-loop
+ * deferral. That deferral re-polls in a tight loop, so a short window is right there;
+ * these checks run once per full-queue event / per copied file, and the beacon is
+ * only stamped when a FUSE op *arrives* — so while the foreground is busy working
+ * through a long/large operation the beacon can sit stale past 250 ms even though it
+ * is anything but idle. A generous window keeps us yielding through that, and scales
+ * with how hard the operator asked us to favor the foreground. */
+static int should_yield_to_foreground(void)
+{
+	if (s_backoff_ms <= 0 || evict_pressure() ||
+	    atomic_load_explicit(&s_final_drain, memory_order_relaxed))
+		return 0;
+	long long idle = activity_idle_ms();
+	return idle >= 0 && idle < s_backoff_ms;
+}
+
 /* ---- thread control ---- */
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -128,9 +155,23 @@ static int desired_workers(void)
 	return v;
 }
 
+/* Wait up to `ms` on pool_not_empty (pool_mtx held). Wakes early on new work or the
+ * stop/unmount broadcast, so a backing-off worker re-evaluates each slice and unmount
+ * never has to wait out a full slice. */
+static void pool_timedwait_ms(long ms)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	long ns = ts.tv_nsec + (ms % 1000) * 1000000L;
+	ts.tv_sec += ms / 1000 + ns / 1000000000L;
+	ts.tv_nsec = ns % 1000000000L;
+	pthread_cond_timedwait(&pool_not_empty, &pool_mtx, &ts);
+}
+
 static void *pool_worker(void *arg)
 {
 	(void)arg;
+	int yielded = 0; /* already backed off once for the job we're about to take */
 	for (;;) {
 		pthread_mutex_lock(&pool_mtx);
 		while (pool_len == 0 && !pool_quit)
@@ -139,6 +180,33 @@ static void *pool_worker(void *arg)
 			pthread_mutex_unlock(&pool_mtx);
 			return NULL;
 		}
+		/* Yield to an active foreground before starting the next copy: each
+		 * job ends in a meta_mtx-taking meta_mark_flags and a backend write,
+		 * so a burst of in-flight copies would keep contending with the mount
+		 * even after the producer stopped submitting. The yield is bounded to
+		 * ONE backoff window per job (not the syncer's 10 s cap): the syncer's
+		 * cycle already runs in the foreground's gaps, so the worker only needs
+		 * to space its copies out, and a small flush must never be stuck behind
+		 * a long cap. Under sustained load this throttles to ~one job per window
+		 * per worker; skipped on quit / backpressure / final-drain so unmount
+		 * and a near-full cache always push through. (The job stays queued while
+		 * we wait, so pool_drain just blocks meanwhile — harmless.) */
+		if (!pool_quit && !yielded && should_yield_to_foreground()) {
+			/* Sleep only until the beacon would go stale, not a full
+			 * slice — the window equals the slice, so a fixed slice
+			 * could overshoot. A refresh during the wait doesn't extend
+			 * it: one window per job, full stop. */
+			long wait = (long)(s_backoff_ms - activity_idle_ms());
+			if (wait < 1)
+				wait = 1;
+			else if (wait > s_backoff_ms)
+				wait = s_backoff_ms;
+			pool_timedwait_ms(wait);
+			yielded = 1;
+			pthread_mutex_unlock(&pool_mtx);
+			continue; /* re-check pool_len/quit, then take the job */
+		}
+		yielded = 0;
 		struct pool_job job = pool_q[pool_head];
 		pool_head = (pool_head + 1) % POOL_QUEUE_MAX;
 		pool_len--;
@@ -175,15 +243,23 @@ static void pool_start(void)
 	pthread_mutex_unlock(&pool_mtx);
 }
 
-/* Enqueue a job (blocks while the queue is full). With no pool started, runs the
- * job inline so callers work unconditionally. */
-static void pool_submit(void (*fn)(void *), void *arg)
+/* Enqueue a job. With no pool started, runs the job inline so callers work
+ * unconditionally (returns 1). Otherwise, if `block` is set, waits for a free slot
+ * and enqueues (returns 1); if `block` is clear and the queue is full, enqueues
+ * nothing and returns 0 — letting the caller back off instead of stalling the
+ * producer thread (which, while parked here, keeps the workers — and their
+ * meta_mtx traffic — starving the foreground for the whole drain). */
+static int pool_enqueue(void (*fn)(void *), void *arg, int block)
 {
 	pthread_mutex_lock(&pool_mtx);
 	if (!pool_started) {
 		pthread_mutex_unlock(&pool_mtx);
 		fn(arg);
-		return;
+		return 1;
+	}
+	if (!block && pool_len == POOL_QUEUE_MAX) {
+		pthread_mutex_unlock(&pool_mtx);
+		return 0;
 	}
 	while (pool_len == POOL_QUEUE_MAX && !pool_quit)
 		pthread_cond_wait(&pool_not_full, &pool_mtx);
@@ -193,6 +269,7 @@ static void pool_submit(void (*fn)(void *), void *arg)
 	pool_len++;
 	pthread_cond_signal(&pool_not_empty);
 	pthread_mutex_unlock(&pool_mtx);
+	return 1;
 }
 
 /* Block until every submitted job has completed. */
@@ -430,11 +507,12 @@ static void phase_structural(struct omdfs_status *st)
  * meta_mark_flags / dirtyset_add are internally locked, the status counters are
  * guarded by s_stat_mtx.
  *
- * When `dry` is set (the flush is paused via state/flush-off) we never touch the
- * backend and never clear the flags: we just count the entry into the backlog and
- * re-arm its directory, exactly as the failure path does — so the status stays
- * honest about what is waiting and the dirty-set is preserved for when flushing
- * resumes. A dry entry always runs inline (flush_submit never hands it to the
+ * When `dry` is set — the flush is paused (state/flush-off), or the pool queue
+ * saturated mid-cycle and we are yielding to a busy foreground (see flush_submit)
+ * — we never touch the backend and never clear the flags: we just count the entry
+ * into the backlog and re-arm its directory, exactly as the failure path does — so
+ * the status stays honest about what is waiting and the dirty-set is preserved for
+ * a later cycle. A dry entry always runs inline (flush_submit never hands it to the
  * pool), so `dry` is read only on the syncer thread. */
 static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 			struct omdfs_status *st, int dry)
@@ -489,15 +567,32 @@ static void flush_worker(void *p)
 	free(a);
 }
 
+/* Per-cycle flush context, threaded through the walk on the (single) syncer/drain
+ * thread. `dry` (state/flush-off) is fixed for the cycle; `saturated` flips on once
+ * the pool queue fills while we are allowed to yield, after which the walk unwinds
+ * (the remaining dirty work is re-armed for a later cycle). `may_yield` is cleared
+ * for the first cycle and the unmount drain, which must push everything regardless
+ * of foreground load. */
+struct flush_ctx {
+	struct omdfs_status *st;
+	int dry;
+	int may_yield;
+	int saturated;
+};
+
 /* Hand one dirty entry to the pool (deep-copying what the worker needs, since the
- * loaded index is freed as soon as the producer returns). Falls back to flushing
- * inline if the copy can't be allocated. A dry (paused) flush does no backend I/O
- * and runs inline — no need to deep-copy or wake a worker. */
+ * loaded index is freed as soon as the producer returns). A dry (paused or
+ * already-saturated) flush does no backend I/O and runs inline — no need to
+ * deep-copy or wake a worker. If the queue is full and we should yield to a busy
+ * foreground, latch `saturated` and dry-count this entry (re-arming its directory);
+ * the callers then unwind the walk, leaving the rest dirty to drain on a later,
+ * quieter cycle. Otherwise block for a slot. Falls back to flushing inline if the
+ * copy can't be allocated. */
 static void flush_submit(const char *fuse_dir, const struct omdfs_entry *e,
-			 struct omdfs_status *st, int dry)
+			 struct flush_ctx *ctx)
 {
-	if (dry) {
-		flush_entry(fuse_dir, e, st, 1);
+	if (ctx->dry || ctx->saturated) {
+		flush_entry(fuse_dir, e, ctx->st, 1);
 		return;
 	}
 	struct flush_arg *a = malloc(sizeof(*a));
@@ -506,9 +601,21 @@ static void flush_submit(const char *fuse_dir, const struct omdfs_entry *e,
 		a->e = *e;
 		a->e.name = strdup(e->name);
 		a->e.link = e->link ? strdup(e->link) : NULL;
-		a->st = st;
+		a->st = ctx->st;
 		if (a->dir && a->e.name && (!e->link || a->e.link)) {
-			pool_submit(flush_worker, a);
+			if (pool_enqueue(flush_worker, a, 0 /* try, don't block */))
+				return;
+			/* Queue full. */
+			if (ctx->may_yield && should_yield_to_foreground()) {
+				free(a->dir);
+				free(a->e.name);
+				free(a->e.link);
+				free(a);
+				ctx->saturated = 1;
+				flush_entry(fuse_dir, e, ctx->st, 1);
+				return;
+			}
+			pool_enqueue(flush_worker, a, 1 /* block for a slot */);
 			return;
 		}
 		free(a->dir);
@@ -516,29 +623,35 @@ static void flush_submit(const char *fuse_dir, const struct omdfs_entry *e,
 		free(a->e.link);
 		free(a);
 	}
-	flush_entry(fuse_dir, e, st, 0); /* OOM: just do it here */
+	flush_entry(fuse_dir, e, ctx->st, 0); /* OOM: just do it here */
 }
 
-/* Submit every dirty entry of an already-loaded index to the pool. */
+/* Submit every dirty entry of an already-loaded index to the pool. Stops early
+ * once the cycle saturates (flush_submit latched it on this or an earlier entry):
+ * the directory is re-armed in the dirty-set by that entry's dry-count, so its
+ * not-yet-visited dirty entries are retried next cycle — no point loading/scanning
+ * further and contending for meta_mtx with the foreground we just yielded to. */
 static void flush_loaded(const char *fuse_dir, struct omdfs_index *idx,
-			 struct omdfs_status *st, int dry)
+			 struct flush_ctx *ctx)
 {
 	for (size_t i = 0; i < idx->n; i++) {
 		struct omdfs_entry *e = &idx->entries[i];
 		if (!(e->flags & (OMDFS_F_DIRTY_CONTENT | OMDFS_F_DIRTY_ATTR)))
 			continue;
-		flush_submit(fuse_dir, e, st, dry);
+		flush_submit(fuse_dir, e, ctx);
+		if (ctx->saturated)
+			return;
 	}
 }
 
 /* Submit one directory's own dirty entries (non-recursive). A removed/uncached
  * directory has nothing to flush. */
-static void flush_one_dir(const char *fuse_dir, struct omdfs_status *st, int dry)
+static void flush_one_dir(const char *fuse_dir, struct flush_ctx *ctx)
 {
 	struct omdfs_index idx;
 	if (meta_try_load(fuse_dir, &idx) != 0)
 		return;
-	flush_loaded(fuse_dir, &idx, st, dry);
+	flush_loaded(fuse_dir, &idx, ctx);
 	meta_free_index(&idx);
 }
 
@@ -546,20 +659,20 @@ static void flush_one_dir(const char *fuse_dir, struct omdfs_status *st, int dry
  * Used on the first cycle (dirty flags survive a crash but the in-memory set
  * starts empty) and whenever the set asks for a full rescan. A directory that
  * can't be fully flushed is re-recorded by the worker (flush_entry on failure). */
-static void flush_tree(const char *fuse_dir, struct omdfs_status *st, int dry)
+static void flush_tree(const char *fuse_dir, struct flush_ctx *ctx)
 {
 	struct omdfs_index idx;
 	if (meta_try_load(fuse_dir, &idx) != 0)
 		return; /* not a cached directory */
 
-	flush_loaded(fuse_dir, &idx, st, dry);
+	flush_loaded(fuse_dir, &idx, ctx);
 
-	for (size_t i = 0; i < idx.n; i++) {
+	for (size_t i = 0; i < idx.n && !ctx->saturated; i++) {
 		if (idx.entries[i].type != OMDFS_T_DIR)
 			continue;
 		char child[PATH_MAX];
 		join_path(child, fuse_dir, idx.entries[i].name);
-		flush_tree(child, st, dry);
+		flush_tree(child, ctx);
 	}
 	meta_free_index(&idx);
 }
@@ -573,18 +686,35 @@ static void flush_tree(const char *fuse_dir, struct omdfs_status *st, int dry)
  * When `dry` is set the flush is paused (state/flush-off): the same discovery runs
  * but nothing is pushed and no flag is cleared — each visited dirty entry is only
  * counted into the backlog and re-armed in the dirty-set (so the set survives the
- * dirtyset_take here and the work resumes intact once flushing is re-enabled). */
-static void flush_pending(struct omdfs_status *st, int dry)
+ * dirtyset_take here and the work resumes intact once flushing is re-enabled).
+ *
+ * A normal (may_yield) cycle bounds itself: if the pool queue fills while the
+ * foreground is busy it stops submitting and dry-counts the remainder (saturated),
+ * so the cycle returns promptly instead of pinning the workers — and meta_mtx —
+ * against the foreground for the whole backlog. It then stops walking entirely
+ * (no point scanning directories it won't flush) and makes sure the work it never
+ * reached is retried next cycle: the targeted path re-arms the remaining queued
+ * directories, the full-walk path forces a fresh rescan. The deferred work drains
+ * on a later, quieter cycle. */
+static void flush_pending(struct flush_ctx *ctx)
 {
 	size_t n;
 	int full;
 	char **dirs = dirtyset_take(&n, &full);
 	if (full) {
 		dirtyset_free(dirs, n); /* the walk rediscovers everything */
-		flush_tree("/", st, dry);
+		flush_tree("/", ctx);
+		if (ctx->saturated)
+			dirtyset_force_full(); /* re-scan: we stopped mid-walk */
 	} else {
-		for (size_t i = 0; i < n; i++)
-			flush_one_dir(dirs[i], st, dry);
+		size_t i = 0;
+		for (; i < n && !ctx->saturated; i++)
+			flush_one_dir(dirs[i], ctx);
+		/* Saturated mid-list: the directories we never visited aren't in
+		 * the set anymore (take emptied it), so re-arm them for next cycle.
+		 * The one we stopped on is already re-armed by its dry-count. */
+		for (; i < n; i++)
+			dirtyset_add(dirs[i]);
 		dirtyset_free(dirs, n);
 	}
 	pool_drain(); /* dry: nothing was submitted, so this is a no-op */
@@ -679,7 +809,9 @@ static void resync_entry(const char *fuse_dir, const struct omdfs_entry *e,
 			a->size = (long long)e->st.st_size;
 			a->rs = rs;
 			if (a->cpath && a->bpath) {
-				pool_submit(resync_copy_worker, a);
+				/* resync is an explicit operator reconcile that
+				 * must push everything: block for a slot. */
+				pool_enqueue(resync_copy_worker, a, 1);
 				return;
 			}
 			free(a->cpath);
@@ -1000,8 +1132,10 @@ static int flush_disabled(void)
 /* ---- cycle + thread ---- */
 
 /* Run one full sync cycle and fill `st` with the resulting backlog/health so the
- * caller can publish it. */
-static void sync_once(struct omdfs_status *st)
+ * caller can publish it. `may_yield` lets a normal cycle bound its own flush and
+ * defer to a busy foreground when the pool queue fills; it is cleared for the first
+ * cycle and the unmount drain, which must push everything. */
+static void sync_once(struct omdfs_status *st, int may_yield)
 {
 	memset(st, 0, sizeof(*st));
 
@@ -1011,8 +1145,10 @@ static void sync_once(struct omdfs_status *st)
 	int dry = flush_disabled(); /* state/flush-off: pause phase 2, still count it */
 	st->flush_disabled = dry;
 
+	struct flush_ctx ctx = { .st = st, .dry = dry, .may_yield = may_yield };
+
 	phase_structural(st); /* backend dirs/files exist before content flush */
-	flush_pending(st, dry);
+	flush_pending(&ctx);
 
 	/* Flushed content is now clean and may be reclaimed; this also refreshes
 	 * the backpressure flag (clears it once dirty data has drained). */
@@ -1090,7 +1226,7 @@ static void *syncer_loop(void *arg)
 		pthread_mutex_unlock(&s_lock);
 
 		struct omdfs_status st;
-		sync_once(&st);
+		sync_once(&st, !first_cycle); /* first cycle must not yield */
 		status_publish(&st);
 		first_cycle = 0;
 		if (stop)
@@ -1119,12 +1255,12 @@ int syncer_start(void)
 
 void syncer_kick(void)
 {
-	/* Every kick comes from a foreground op (a mutation, release, or fsync), so
-	 * it doubles as an activity stamp — the read-only ops (getattr/readdir/…)
-	 * that don't kick stamp the beacon directly. This lets a write burst batch:
-	 * the kick asks to sync, but the fresh beacon makes the syncer back off and
-	 * drain the burst together once it quiesces. */
-	syncer_note_activity();
+	/* Pure signal: ask the syncer to run a cycle. The activity beacon is NOT
+	 * stamped here — every FUSE handler (read-only and mutating alike) calls
+	 * syncer_note_activity() on entry, so the background thread sees the foreground
+	 * the moment an op starts, not only when the op finishes and kicks. (A kick at
+	 * the end of a write burst would tell the syncer to run while the beacon, if it
+	 * were stamped only here, looked stale mid-burst.) */
 	pthread_mutex_lock(&s_lock);
 	s_kick = 1;
 	pthread_cond_signal(&s_cond);
@@ -1135,6 +1271,14 @@ void syncer_stop(void)
 {
 	if (!s_running)
 		return;
+	/* From here on this is the clean-unmount drain: it must push everything, so
+	 * neither the syncer's final cycle nor the pool workers may back off to the
+	 * foreground (should_yield_to_foreground checks this). Set before signalling
+	 * stop so the thread's own last cycle already sees it. */
+	atomic_store_explicit(&s_final_drain, 1, memory_order_relaxed);
+	pthread_mutex_lock(&pool_mtx);
+	pthread_cond_broadcast(&pool_not_empty); /* wake backing-off workers to re-check */
+	pthread_mutex_unlock(&pool_mtx);
 	pthread_mutex_lock(&s_lock);
 	s_stop = 1;
 	pthread_cond_signal(&s_cond);
@@ -1152,7 +1296,7 @@ void syncer_stop(void)
 	memset(&st, 0, sizeof(st));
 	for (int i = 0; i < DRAIN_MAX; i++) {
 		long prev = st.pending_structural + st.dirty_files;
-		sync_once(&st);
+		sync_once(&st, 0); /* unmount drain: push everything, never yield */
 		long now = st.pending_structural + st.dirty_files;
 		if (now == 0)
 			break; /* fully drained */

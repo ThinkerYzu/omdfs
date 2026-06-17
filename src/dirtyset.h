@@ -23,6 +23,12 @@
  * Idempotent; safe to call from foreground and background threads. */
 void dirtyset_add(const char *fuse_dir);
 
+/* Force the next dirtyset_take to request a full tree scan. The syncer uses this
+ * when it abandons a flush cycle partway (the pool queue saturated and it yielded
+ * to the foreground) and so cannot enumerate the directories it never reached — a
+ * full rescan next cycle rediscovers all still-dirty directories. */
+void dirtyset_force_full(void);
+
 /* Re-key membership across a rename of `from` to `to`: any recorded directory
  * equal to `from` or nested under it ("from/...") is rewritten to the matching
  * path under `to`. A no-op when `from` names a file (no such keys exist). */

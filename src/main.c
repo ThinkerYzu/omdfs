@@ -217,6 +217,7 @@ static int omdfs_write(const char *path, const char *buf, size_t size,
 static int omdfs_release(const char *path, struct fuse_file_info *fi)
 {
 	(void)path;
+	syncer_note_activity();
 	content_close((struct content_handle *)(uintptr_t)fi->fh);
 	syncer_kick(); /* push any just-closed dirty content */
 	return 0;
@@ -226,6 +227,7 @@ static int omdfs_fsync(const char *path, int datasync, struct fuse_file_info *fi
 {
 	(void)path;
 	(void)datasync;
+	syncer_note_activity();
 	int r = content_fsync((struct content_handle *)(uintptr_t)fi->fh);
 	if (r == 0)
 		syncer_kick();
@@ -236,6 +238,7 @@ static int omdfs_fsync(const char *path, int datasync, struct fuse_file_info *fi
 
 static int omdfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 	if (is_reserved(name))
@@ -269,6 +272,7 @@ static int omdfs_create(const char *path, mode_t mode, struct fuse_file_info *fi
 
 static int omdfs_mkdir(const char *path, mode_t mode)
 {
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 	if (is_reserved(name))
@@ -297,6 +301,7 @@ static int omdfs_mkdir(const char *path, mode_t mode)
 
 static int omdfs_unlink(const char *path)
 {
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 
@@ -314,6 +319,7 @@ static int omdfs_unlink(const char *path)
 
 static int omdfs_rmdir(const char *path)
 {
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 
@@ -338,6 +344,7 @@ static int omdfs_rmdir(const char *path)
 
 static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 {
+	syncer_note_activity();
 	if (flags) /* RENAME_EXCHANGE / RENAME_NOREPLACE unsupported */
 		return -EINVAL;
 
@@ -389,6 +396,7 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 
 static int omdfs_symlink(const char *target, const char *path)
 {
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 	if (is_reserved(name))
@@ -426,6 +434,7 @@ static int omdfs_truncate(const char *path, off_t size,
 			  struct fuse_file_info *fi)
 {
 	(void)fi;
+	syncer_note_activity();
 	int r = content_truncate(path, size);
 	if (r == 0)
 		syncer_kick();
@@ -435,6 +444,7 @@ static int omdfs_truncate(const char *path, off_t size,
 static int omdfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
 	(void)fi;
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 	struct stat st;
@@ -449,6 +459,7 @@ static int omdfs_chown(const char *path, uid_t uid, gid_t gid,
 		       struct fuse_file_info *fi)
 {
 	(void)fi;
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 	struct stat st;
@@ -465,6 +476,7 @@ static int omdfs_utimens(const char *path, const struct timespec tv[2],
 			 struct fuse_file_info *fi)
 {
 	(void)fi;
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 	struct stat st;
