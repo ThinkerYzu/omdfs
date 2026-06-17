@@ -82,6 +82,15 @@ static void index_path(char out[PATH_MAX], const char *fuse_dir)
 	snprintf(out, PATH_MAX, "%s/%s", cdir, OMDFS_INDEX_NAME);
 }
 
+/* Is `name` the index file or one of its mkstemp temporaries (".omdfs.dir.*")?
+ * Those are the only cache-directory entries that don't represent real content. */
+static int is_index_name(const char *name)
+{
+	size_t n = strlen(OMDFS_INDEX_NAME);
+	return !strcmp(name, OMDFS_INDEX_NAME) ||
+	       (!strncmp(name, OMDFS_INDEX_NAME, n) && name[n] == '.');
+}
+
 /* ---- in-memory index management ---- */
 
 static int idx_push(struct omdfs_index *idx, const struct omdfs_entry *e)
@@ -593,6 +602,89 @@ void meta_forget_tree(const char *prefix)
 		}
 	}
 	pthread_mutex_unlock(&meta_mtx);
+}
+
+int meta_evict_cold(const char *fuse_dir)
+{
+	if (fuse_dir[0] == '/' && fuse_dir[1] == '\0')
+		return 0; /* never evict the root's index */
+
+	pthread_mutex_lock(&meta_mtx);
+
+	/* Check for un-synced (dirty) children. Use the in-memory canonical if it
+	 * is already present; otherwise load straight from disk (load-only, never
+	 * building from the backend) so a cold directory we are about to drop is not
+	 * pulled into the cache. */
+	struct omdfs_index local;
+	int loaded = 0;
+	struct cnode *cn = cache_find(fuse_dir);
+	const struct omdfs_index *idx;
+	if (cn) {
+		idx = &cn->idx;
+	} else if (load_index(fuse_dir, &local) == 0) {
+		idx = &local;
+		loaded = 1;
+	} else {
+		pthread_mutex_unlock(&meta_mtx);
+		return 0; /* no usable on-disk index: nothing to evict */
+	}
+	int dirty = 0;
+	for (size_t i = 0; i < idx->n; i++)
+		if (idx->entries[i].flags & OMDFS_F_DIRTY) {
+			dirty = 1;
+			break;
+		}
+	if (loaded)
+		meta_free_index(&local);
+	if (dirty) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 0; /* a child still needs flushing: keep the index */
+	}
+
+	/* The cache directory must hold nothing but the index (+ any stale temp):
+	 * no cached content files and no cached child subdirectory. Then dropping
+	 * the index loses no local state — the listing rebuilds from the backend on
+	 * next access. Collect the index/temp names in the same pass (we must not
+	 * unlink while iterating the directory stream). */
+	char cdir[PATH_MAX];
+	cache_path(cdir, fuse_dir);
+	DIR *dp = opendir(cdir);
+	if (!dp) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
+	char victims[64][256];
+	int nv = 0, only_index = 1;
+	struct dirent *de;
+	while ((de = readdir(dp)) != NULL) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		if (is_index_name(de->d_name)) {
+			if (nv < 64)
+				snprintf(victims[nv++], sizeof(victims[0]), "%s",
+					 de->d_name);
+			continue;
+		}
+		only_index = 0;
+		break;
+	}
+	closedir(dp);
+	if (!only_index) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 0; /* cached content or a child subdir is still present */
+	}
+
+	/* Reclaim: remove the index (+ temps), drop the in-memory copy, and rmdir
+	 * the now-empty cache directory so an ancestor can collapse in turn. */
+	for (int i = 0; i < nv; i++) {
+		char p[PATH_MAX];
+		snprintf(p, sizeof(p), "%s/%s", cdir, victims[i]);
+		unlink(p);
+	}
+	cache_drop(fuse_dir);
+	rmdir(cdir); /* best-effort; leaves nothing behind on success */
+	pthread_mutex_unlock(&meta_mtx);
+	return 1;
 }
 
 int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,

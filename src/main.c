@@ -392,8 +392,14 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	cache_path(cto, to);
 	cache_path(ctodir, tp);
 	mkdirs(ctodir);
-	/* Uncached file -> no cache file to move (ENOENT is fine). */
-	(void)rename(cfrom, cto);
+	/* Uncached file -> no cache file to move (ENOENT is fine). A cold-metadata
+	 * eviction may also have rmdir'd the destination cache dir between mkdirs and
+	 * here; on ENOENT recreate it once and retry so a cached file lands at its new
+	 * path. (meta_move_entry's save_index recreates the dir for metadata anyway.) */
+	if (rename(cfrom, cto) != 0 && errno == ENOENT) {
+		mkdirs(ctodir);
+		(void)rename(cfrom, cto);
+	}
 
 	int r = meta_move_entry(fp, fn, tp, tn);
 	if (r != 0)
@@ -423,8 +429,13 @@ static int omdfs_symlink(const char *target, const char *path)
 	cache_path(cp, path);
 	cache_path(cdir, parent);
 	mkdirs(cdir);
-	if (symlink(target, cp) != 0)
-		return -errno;
+	if (symlink(target, cp) != 0) {
+		/* A cold-metadata eviction may have rmdir'd the parent cache dir
+		 * between mkdirs and here; recreate it once and retry. */
+		if (errno != ENOENT || mkdirs(cdir) != 0 ||
+		    symlink(target, cp) != 0)
+			return -errno;
+	}
 
 	struct omdfs_entry e;
 	memset(&e, 0, sizeof(e));

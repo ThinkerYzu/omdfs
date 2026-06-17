@@ -23,6 +23,14 @@
 #                      backend copy drifted (something the normal syncer never re-pushes)
 #                      is forced back to the cache, the trigger is consumed once, and the
 #                      result is surfaced in the status file.
+#   I/J. mark-dirty  — offline --mark-dirty and the live state/mark-dirty trigger flag
+#                      the cache dirty so the background syncer re-pushes it.
+#   K. cold metadata — a directory whose cached content has all been evicted (its cache
+#                      dir holds only .omdfs.dir) has its index reclaimed by a cold-evict
+#                      sweep (state/cold-evict): the on-disk .omdfs.dir is removed and the
+#                      cache dir rmdir'd, yet the directory stays listable (rebuilt from
+#                      the backend) and its files re-fetch correctly. A directory with a
+#                      dirty (un-synced) child keeps its index.
 #
 # Usage: tests/hardening.sh [path-to-omdfs-binary]   (default: ./omdfs)
 
@@ -388,6 +396,58 @@ jres="$(status_field "$J/data" last-mark-dirty-result)"
 	&& ok "status reports the last-mark-dirty result ($jres)" \
 	|| no "status reports the last-mark-dirty result (got '$jres')"
 fusermount3 -u "$J/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
+
+# ============================================================
+# K. cold-metadata-index eviction reclaims a cold directory's index
+# ============================================================
+# A subdirectory whose cached content is all evicted (LRU pressure) ends up with a
+# cache dir holding only .omdfs.dir. A cold-evict sweep removes that index and
+# rmdir's the cache dir, while the directory stays listable (rebuilt from the
+# backend) and its files re-fetch. A directory that still holds cached content (and
+# the root) keep their index.
+K="$WORK/k"; mkdir -p "$K/backend/sub" "$K/backend/other" "$K/data" "$K/mnt"
+KFSZ=204800; KBUDGET=524288       # 200 KiB files, 512 KiB cache
+for i in $(seq 0 4); do head -c "$KFSZ" /dev/urandom > "$K/backend/sub/f$i"; done
+for i in $(seq 0 9); do head -c "$KFSZ" /dev/urandom > "$K/backend/other/g$i"; done
+if ! mount_omdfs "$K/mnt" "$K/omdfs.log" --backend "$K/backend" --datadir "$K/data" --cache-size "$KBUDGET"; then
+	echo "Bail out! omdfs failed to mount (K); log follows:" >&2; cat "$K/omdfs.log" >&2; exit 98
+fi
+# Build sub's index + cache its files, then read 'other' so LRU evicts sub's content.
+for i in $(seq 0 4); do cat "$K/mnt/sub/f$i" >/dev/null; done
+for i in $(seq 0 9); do cat "$K/mnt/other/g$i" >/dev/null; done
+ksub_content() { find "$K/data/cache/sub" -type f ! -name "$INDEX" ! -name "$INDEX".* 2>/dev/null | wc -l; }
+ksub_empty() { [ "$(ksub_content)" -eq 0 ]; }
+wait_for "cold dir's cached content is fully evicted" ksub_empty
+[ -f "$K/data/cache/sub/$INDEX" ] \
+	&& ok "cold dir still has its on-disk index before the sweep" \
+	|| no "cold dir still has its on-disk index before the sweep"
+
+touch "$K/data/state/cold-evict"          # operator forces a cold-metadata sweep
+kindex_gone() { [ ! -e "$K/data/cache/sub/$INDEX" ]; }
+wait_for "cold-evict removes the cold directory's .omdfs.dir" kindex_gone
+[ ! -e "$K/data/cache/sub" ] \
+	&& ok "cold-evict rmdir's the now-empty cache directory" \
+	|| no "cold-evict rmdir's the now-empty cache directory"
+ktrigger_gone() { [ ! -e "$K/data/state/cold-evict" ]; }
+wait_for "cold-evict consumes the trigger file (one-shot)" ktrigger_gone
+
+# Still listable (rebuilt from the backend) and the files re-fetch byte-correct.
+kn="$(ls "$K/mnt/sub" 2>/dev/null | wc -l)"
+[ "$kn" -eq 5 ] \
+	&& ok "cold dir still listable after index eviction (rebuilt from backend)" \
+	|| no "cold dir still listable after index eviction (got $kn of 5)"
+cmp -s "$K/mnt/sub/f0" "$K/backend/sub/f0" \
+	&& ok "evicted-index dir's file re-fetches byte-correct" \
+	|| no "evicted-index dir's file re-fetches byte-correct"
+# A directory still holding cached content keeps its index; the root always does.
+{ [ -f "$K/data/cache/other/$INDEX" ] && [ -f "$K/data/cache/$INDEX" ]; } \
+	&& ok "a content-holding directory (and the root) keep their index" \
+	|| no "a content-holding directory (and the root) keep their index"
+kswept="$(status_field "$K/data" cold-meta-evicted)"
+{ [ -n "$kswept" ] && [ "$kswept" -ge 1 ]; } \
+	&& ok "status reports the cold-meta-evicted count ($kswept)" \
+	|| no "status reports the cold-meta-evicted count (got '$kswept')"
+fusermount3 -u "$K/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
 
 # ---- summary ----
 echo "1..$COUNT"

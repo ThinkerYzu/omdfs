@@ -113,6 +113,17 @@ void meta_forget(const char *fuse_dir);
  * (the on-disk cache subtree has moved). */
 void meta_forget_tree(const char *prefix);
 
+/* Cold-metadata-index eviction. Reclaim the on-disk `.omdfs.dir` of a cold
+ * directory whose listing can be faithfully rebuilt from the backend: if
+ * `fuse_dir` (never the root) has no un-synced (dirty) children and its cache
+ * directory holds nothing but the index file, remove the index, drop the
+ * in-memory copy, and rmdir the now-empty cache directory (so an ancestor can
+ * collapse in turn). Returns 1 if the index was evicted, 0 if the directory was
+ * kept (root, no on-disk index, a dirty child, or any cached content/subdir
+ * present). The caller MUST ensure the backend is caught up (no pending
+ * structural ops) so the rebuilt listing cannot reintroduce a stale entry. */
+int meta_evict_cold(const char *fuse_dir);
+
 /* Release an index loaded by meta_get_index(). */
 void meta_free_index(struct omdfs_index *idx);
 

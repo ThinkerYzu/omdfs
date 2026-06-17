@@ -36,6 +36,7 @@ struct omdfs_status {
 	char last_resync[256];     /* one-line summary of that resync ("" = never run) */
 	long long last_mark_epoch; /* secs of the last operator-triggered mark-dirty (0 = never) */
 	char last_mark[256];       /* one-line summary of that mark-dirty ("" = never run) */
+	long cold_evicted;         /* cold metadata indexes reclaimed since mount */
 };
 
 /* Record the daemon start and write an initial "starting" status file. Call once

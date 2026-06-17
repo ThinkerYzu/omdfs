@@ -105,14 +105,15 @@ void status_publish(const struct omdfs_status *s)
 		"last-resync: %s\n"
 		"last-resync-result: %s\n"
 		"last-mark-dirty: %s\n"
-		"last-mark-dirty-result: %s\n",
+		"last-mark-dirty-result: %s\n"
+		"cold-meta-evicted: %ld\n",
 		overall(s), now_s, started_s, last_s,
 		s->pending_structural, s->dirty_files, s->dirty_bytes,
 		s->cache_bytes, s->cache_budget, s->cache_hard_limit,
 		s->backpressure ? "yes" : "no",
 		s->stuck ? "yes" : "no",
 		stuck_op, stuck_path, errbuf, resync_s, resync_res,
-		mark_s, mark_res);
+		mark_s, mark_res, s->cold_evicted);
 	if (len < 0)
 		return;
 	if (len > (int)sizeof(body))

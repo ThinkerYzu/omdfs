@@ -11,6 +11,7 @@
 #include "omdfs.h"
 #include "status.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -822,6 +823,101 @@ static void maybe_live_resync(void)
 			 "; structural op blocked (errno %d)", blk.stuck_errno);
 }
 
+/* ---- cold-metadata-index eviction ---- */
+
+/* How often the automatic sweep runs (the first one fires on the first eligible
+ * clean cycle, then at most this often). */
+#define COLD_META_INTERVAL_S 60
+
+static long long s_last_cold_sweep;    /* epoch of the last sweep (0 = never) */
+static long s_cold_evicted_total;      /* cumulative indexes reclaimed, for status */
+
+/* Whether cold-metadata-index eviction runs automatically. Tied to a configured
+ * cache budget (a bounded footprint implies bounding metadata too), unless the
+ * OMDFS_COLD_META env var forces it on (non-zero) or off (0). An operator can
+ * always force a one-shot sweep via the state/cold-evict trigger regardless. */
+static int cold_meta_enabled(void)
+{
+	const char *s = getenv("OMDFS_COLD_META");
+	if (s && *s)
+		return atoi(s) != 0;
+	return evict_budget() > 0;
+}
+
+/* Post-order walk of the on-disk cache tree: reclaim each cold directory's index
+ * (meta_evict_cold) only after its children, so an emptied subtree collapses
+ * upward in a single pass. `cache_dir` mirrors FUSE path `fuse_dir`. Child names
+ * are collected before recursing so we never mutate (rmdir) a directory while
+ * iterating its own stream. */
+static void cold_sweep(const char *cache_dir, const char *fuse_dir, long *evicted)
+{
+	char (*kids)[256] = NULL;
+	size_t nk = 0, cap = 0;
+	DIR *dp = opendir(cache_dir);
+	if (dp) {
+		struct dirent *de;
+		while ((de = readdir(dp)) != NULL) {
+			if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+				continue;
+			char ccp[PATH_MAX];
+			snprintf(ccp, sizeof(ccp), "%s/%s", cache_dir, de->d_name);
+			struct stat stt;
+			if (lstat(ccp, &stt) != 0 || !S_ISDIR(stt.st_mode))
+				continue; /* only subdirectories carry child indexes */
+			if (nk == cap) {
+				size_t ncap = cap ? cap * 2 : 16;
+				char (*p)[256] = realloc(kids, ncap * sizeof(*kids));
+				if (!p)
+					break; /* OOM: skip the rest of this dir's kids */
+				kids = p;
+				cap = ncap;
+			}
+			snprintf(kids[nk++], 256, "%s", de->d_name);
+		}
+		closedir(dp);
+	}
+	for (size_t i = 0; i < nk; i++) {
+		char ccp[PATH_MAX], cfp[PATH_MAX];
+		snprintf(ccp, sizeof(ccp), "%s/%s", cache_dir, kids[i]);
+		join_path(cfp, fuse_dir, kids[i]);
+		cold_sweep(ccp, cfp, evicted);
+	}
+	free(kids);
+
+	if (meta_evict_cold(fuse_dir)) /* a no-op for "/" (root keeps its index) */
+		(*evicted)++;
+}
+
+/* Reclaim cold directory indexes when it is safe to do so. Called only on a
+ * fully-clean cycle (no pending structural ops, so the backend listing matches
+ * the cache and an evicted index rebuilds faithfully). Runs on the operator
+ * trigger DATADIR/state/cold-evict (one-shot, forces a sweep even when automatic
+ * eviction is disabled) or, when enabled, on the periodic interval. */
+static void maybe_cold_meta_sweep(struct omdfs_status *st)
+{
+	long long now = (long long)time(NULL);
+
+	char tp[PATH_MAX];
+	snprintf(tp, sizeof(tp), "%s/state/cold-evict", g_cfg.datadir);
+	int forced = (unlink(tp) == 0); /* test-and-claim the trigger, one-shot */
+
+	if (!forced) {
+		if (!cold_meta_enabled())
+			return;
+		if (s_last_cold_sweep &&
+		    now - s_last_cold_sweep < COLD_META_INTERVAL_S)
+			return;
+	}
+
+	char croot[PATH_MAX];
+	cache_path(croot, "/");
+	long evicted = 0;
+	cold_sweep(croot, "/", &evicted);
+	s_cold_evicted_total += evicted;
+	s_last_cold_sweep = now;
+	st->cold_evicted = s_cold_evicted_total;
+}
+
 /* ---- cycle + thread ---- */
 
 /* Run one full sync cycle and fill `st` with the resulting backlog/health so the
@@ -845,10 +941,15 @@ static void sync_once(struct omdfs_status *st)
 	st->cache_hard_limit = (long long)evict_hard_limit();
 	st->backpressure = evict_pressure();
 
-	/* A cycle that left no backlog and hit no stuck op is a clean sync. */
-	if (!st->pending_structural && !st->dirty_files && !st->stuck_errno)
+	/* A cycle that left no backlog and hit no stuck op is a clean sync. Only
+	 * then is it safe to reclaim cold directory indexes: the backend listing
+	 * matches the cache, so a rebuilt index cannot resurrect a pending delete. */
+	if (!st->pending_structural && !st->dirty_files && !st->stuck_errno) {
 		s_last_clean = (long long)time(NULL);
+		maybe_cold_meta_sweep(st);
+	}
 	st->last_sync_epoch = s_last_clean;
+	st->cold_evicted = s_cold_evicted_total;
 
 	/* Carry the most recent live-resync result so it stays visible in status. */
 	st->last_resync_epoch = s_last_resync_epoch;

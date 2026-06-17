@@ -186,6 +186,10 @@ static struct fetch *fetch_start(const char *fuse_path, const char *parent,
 		return NULL;
 	}
 	int wfd = open(cp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (wfd < 0 && errno == ENOENT && mkdirs(cdir) == 0)
+		/* A cold-metadata eviction may have rmdir'd the parent cache dir
+		 * between our mkdirs and here; recreate it once and retry. */
+		wfd = open(cp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (wfd < 0) {
 		*err = -errno;
 		return NULL;
@@ -339,6 +343,10 @@ int content_create(const char *fuse_path, mode_t mode, struct content_handle **o
 		return -errno;
 
 	int fd = open(cp, O_RDWR | O_CREAT | O_TRUNC, mode);
+	if (fd < 0 && errno == ENOENT && mkdirs(cdir) == 0)
+		/* A cold-metadata eviction may have rmdir'd the parent cache dir
+		 * between our mkdirs and here; recreate it once and retry. */
+		fd = open(cp, O_RDWR | O_CREAT | O_TRUNC, mode);
 	if (fd < 0)
 		return -errno;
 
