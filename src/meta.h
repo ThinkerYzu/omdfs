@@ -41,6 +41,14 @@ struct omdfs_index {
 	size_t n;
 	size_t cap;
 	struct omdfs_entry *entries;
+	/* Lazily-built name->slot hash for O(1) meta_lookup (open addressing;
+	 * stores entry indices, so a realloc of `entries` doesn't invalidate it).
+	 * Present only on the in-memory canonical once a directory grows past a
+	 * small threshold; NULL on reader copies and small dirs (linear scan).
+	 * Invalidated (freed) on any entry add/remove/rename; rebuilt on next
+	 * lookup. Internal to meta.c — do not touch directly. */
+	int32_t *hslots;
+	size_t hcap; /* power of two; 0 = no hash */
 };
 
 /* Load the index for `fuse_dir`, building (and persisting) it from the backend
@@ -52,8 +60,28 @@ int meta_get_index(const char *fuse_dir, struct omdfs_index *out);
  * dirty-flush walk, which must only touch already-cached directories. */
 int meta_try_load(const char *fuse_dir, struct omdfs_index *out);
 
-/* Find a child by name, or NULL. */
+/* Find a child by name, or NULL. O(1) via a lazily-built name hash on large
+ * directories (built on the spot, so `idx` is mutated even though the lookup is
+ * logically read-only); falls back to a linear scan on small dirs or OOM. */
 struct omdfs_entry *meta_lookup(struct omdfs_index *idx, const char *name);
+
+/* Single-entry read accessors. Unlike meta_get_index (which deep-copies the
+ * whole directory index per call), these copy out just the one child's fields
+ * on a cache hit — no O(N) clone, no allocation on the hot path. A cold miss
+ * falls back through meta_get_index to build the index from the backend.
+ *
+ * meta_stat: copy child `name`'s stat/type/flags (any of st/type/flags may be
+ *   NULL). Returns 0, -ENOENT if absent, or -errno on a cold build failure.
+ * meta_readlink: copy child `name`'s symlink target into `buf` (NUL-terminated,
+ *   truncated to `size`). -EINVAL if not a symlink, -ENOENT if absent.
+ * meta_dir_stat: copy directory `fuse_dir`'s own attributes (st) and/or child
+ *   count (count); any may be NULL. Used by root getattr and the rmdir
+ *   empty-check. Returns 0 or -errno. */
+int meta_stat(const char *fuse_dir, const char *name, struct stat *st,
+	      uint8_t *type, uint8_t *flags);
+int meta_readlink(const char *fuse_dir, const char *name, char *buf,
+		  size_t size);
+int meta_dir_stat(const char *fuse_dir, struct stat *st, size_t *count);
 
 /* Atomically set `set_bits` and clear `clear_bits` in the flags of child `name`
  * in directory `fuse_dir`, persisting the index. Calls are serialized so

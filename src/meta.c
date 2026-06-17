@@ -93,6 +93,50 @@ static int is_index_name(const char *name)
 
 /* ---- in-memory index management ---- */
 
+/* Below this child count a linear scan beats building/probing a hash. */
+#define META_HASH_MIN 32
+
+static size_t name_hash(const char *s)
+{
+	size_t h = 5381;
+	for (; *s; s++)
+		h = ((h << 5) + h) ^ (unsigned char)*s;
+	return h;
+}
+
+/* Drop any built name hash (call on every add/remove/rename of an entry; the
+ * next meta_lookup rebuilds it if the directory is still large enough). */
+static void idx_hash_drop(struct omdfs_index *idx)
+{
+	free(idx->hslots);
+	idx->hslots = NULL;
+	idx->hcap = 0;
+}
+
+/* Build the name->slot hash for `idx`. Returns 0, or -1 on OOM (lookups then
+ * fall back to a linear scan). */
+static int idx_hash_build(struct omdfs_index *idx)
+{
+	size_t cap = 64;
+	while (cap < idx->n * 2)
+		cap <<= 1;
+	int32_t *t = malloc(cap * sizeof(*t));
+	if (!t)
+		return -1;
+	for (size_t i = 0; i < cap; i++)
+		t[i] = -1;
+	for (size_t i = 0; i < idx->n; i++) {
+		size_t h = name_hash(idx->entries[i].name) & (cap - 1);
+		while (t[h] != -1)
+			h = (h + 1) & (cap - 1);
+		t[h] = (int32_t)i;
+	}
+	free(idx->hslots);
+	idx->hslots = t;
+	idx->hcap = cap;
+	return 0;
+}
+
 static int idx_push(struct omdfs_index *idx, const struct omdfs_entry *e)
 {
 	if (idx->n == idx->cap) {
@@ -105,6 +149,7 @@ static int idx_push(struct omdfs_index *idx, const struct omdfs_entry *e)
 		idx->cap = cap;
 	}
 	idx->entries[idx->n++] = *e;
+	idx_hash_drop(idx); /* names changed: invalidate the lookup hash */
 	return 0;
 }
 
@@ -115,12 +160,29 @@ void meta_free_index(struct omdfs_index *idx)
 		free(idx->entries[i].link);
 	}
 	free(idx->entries);
+	free(idx->hslots);
 	idx->entries = NULL;
-	idx->n = idx->cap = 0;
+	idx->hslots = NULL;
+	idx->n = idx->cap = idx->hcap = 0;
 }
 
 struct omdfs_entry *meta_lookup(struct omdfs_index *idx, const char *name)
 {
+	if (idx->n >= META_HASH_MIN) {
+		if (idx->hslots || idx_hash_build(idx) == 0) {
+			size_t mask = idx->hcap - 1;
+			size_t h = name_hash(name) & mask;
+			for (;;) {
+				int32_t slot = idx->hslots[h];
+				if (slot < 0)
+					return NULL;
+				if (!strcmp(idx->entries[slot].name, name))
+					return &idx->entries[slot];
+				h = (h + 1) & mask;
+			}
+		}
+		/* OOM building the hash: fall through to a linear scan. */
+	}
 	for (size_t i = 0; i < idx->n; i++)
 		if (!strcmp(idx->entries[i].name, name))
 			return &idx->entries[i];
@@ -579,6 +641,109 @@ int meta_try_load(const char *fuse_dir, struct omdfs_index *out)
 	return r;
 }
 
+int meta_stat(const char *fuse_dir, const char *name, struct stat *st,
+	      uint8_t *type, uint8_t *flags)
+{
+	pthread_mutex_lock(&meta_mtx);
+	struct cnode *n = cache_find(fuse_dir);
+	if (n) {
+		struct omdfs_entry *e = meta_lookup(&n->idx, name);
+		if (!e) {
+			pthread_mutex_unlock(&meta_mtx);
+			return -ENOENT;
+		}
+		if (st)
+			*st = e->st;
+		if (type)
+			*type = e->type;
+		if (flags)
+			*flags = e->flags;
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
+	pthread_mutex_unlock(&meta_mtx);
+
+	/* Cold miss: build via the full (tested) path, then read one entry. */
+	struct omdfs_index idx;
+	int r = meta_get_index(fuse_dir, &idx);
+	if (r != 0)
+		return r;
+	struct omdfs_entry *e = meta_lookup(&idx, name);
+	if (e) {
+		if (st)
+			*st = e->st;
+		if (type)
+			*type = e->type;
+		if (flags)
+			*flags = e->flags;
+	}
+	r = e ? 0 : -ENOENT;
+	meta_free_index(&idx);
+	return r;
+}
+
+int meta_readlink(const char *fuse_dir, const char *name, char *buf,
+		  size_t size)
+{
+	pthread_mutex_lock(&meta_mtx);
+	struct cnode *n = cache_find(fuse_dir);
+	if (n) {
+		struct omdfs_entry *e = meta_lookup(&n->idx, name);
+		int r = -ENOENT;
+		if (e) {
+			if (e->type == OMDFS_T_LINK && e->link) {
+				snprintf(buf, size, "%s", e->link);
+				r = 0;
+			} else {
+				r = -EINVAL;
+			}
+		}
+		pthread_mutex_unlock(&meta_mtx);
+		return r;
+	}
+	pthread_mutex_unlock(&meta_mtx);
+
+	struct omdfs_index idx;
+	int r = meta_get_index(fuse_dir, &idx);
+	if (r != 0)
+		return r;
+	struct omdfs_entry *e = meta_lookup(&idx, name);
+	if (!e)
+		r = -ENOENT;
+	else if (e->type != OMDFS_T_LINK || !e->link)
+		r = -EINVAL;
+	else
+		snprintf(buf, size, "%s", e->link);
+	meta_free_index(&idx);
+	return r;
+}
+
+int meta_dir_stat(const char *fuse_dir, struct stat *st, size_t *count)
+{
+	pthread_mutex_lock(&meta_mtx);
+	struct cnode *n = cache_find(fuse_dir);
+	if (n) {
+		if (st)
+			*st = n->idx.dir_st;
+		if (count)
+			*count = n->idx.n;
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
+	pthread_mutex_unlock(&meta_mtx);
+
+	struct omdfs_index idx;
+	int r = meta_get_index(fuse_dir, &idx);
+	if (r != 0)
+		return r;
+	if (st)
+		*st = idx.dir_st;
+	if (count)
+		*count = idx.n;
+	meta_free_index(&idx);
+	return 0;
+}
+
 void meta_forget(const char *fuse_dir)
 {
 	pthread_mutex_lock(&meta_mtx);
@@ -831,6 +996,7 @@ static void drop_at(struct omdfs_index *idx, size_t i)
 	free(idx->entries[i].name);
 	free(idx->entries[i].link);
 	idx->entries[i] = idx->entries[--idx->n];
+	idx_hash_drop(idx); /* slot moved: invalidate the lookup hash */
 }
 
 int meta_remove_entry(const char *fuse_dir, const char *name)
@@ -883,6 +1049,7 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		}
 		free(e->name);
 		e->name = nn;
+		idx_hash_drop(idx); /* name changed in place: invalidate the hash */
 		dst_dirty = (e->flags & OMDFS_F_DIRTY) != 0;
 		r = save_index(old_dir, idx);
 		if (r != 0)

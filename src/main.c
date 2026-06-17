@@ -122,35 +122,18 @@ static int omdfs_getattr(const char *path, struct stat *st,
 
 	if (path[0] == '/' && path[1] == '\0') {
 		/* Serve the root's own attributes from the local index (its
-		 * dir_st, same value readdir fills for "."). meta_get_index
-		 * loads the persisted .omdfs.dir first and only falls back to
-		 * the backend on a miss, so a cached root works with the
-		 * backend gone — consistent with every other path. */
-		struct omdfs_index idx;
-		int r = meta_get_index("/", &idx);
-		if (r != 0)
-			return r;
-		*st = idx.dir_st;
-		meta_free_index(&idx);
-		return 0;
+		 * dir_st, same value readdir fills for "."). meta_dir_stat
+		 * reads the cached index first and only falls back to the
+		 * backend on a miss, so a cached root works with the backend
+		 * gone — consistent with every other path. */
+		return meta_dir_stat("/", st, NULL);
 	}
 
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 
-	struct omdfs_index idx;
-	int r = meta_get_index(parent, &idx);
-	if (r != 0)
-		return r;
-
-	struct omdfs_entry *e = meta_lookup(&idx, name);
-	if (!e) {
-		meta_free_index(&idx);
-		return -ENOENT;
-	}
-	*st = e->st;
-	meta_free_index(&idx);
-	return 0;
+	/* Single-entry read: copy just this child's stat, no whole-dir clone. */
+	return meta_stat(parent, name, st, NULL, NULL);
 }
 
 static int omdfs_readlink(const char *path, char *buf, size_t size)
@@ -158,19 +141,7 @@ static int omdfs_readlink(const char *path, char *buf, size_t size)
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 
-	struct omdfs_index idx;
-	int r = meta_get_index(parent, &idx);
-	if (r != 0)
-		return r;
-
-	struct omdfs_entry *e = meta_lookup(&idx, name);
-	if (!e || e->type != OMDFS_T_LINK || !e->link) {
-		meta_free_index(&idx);
-		return e ? -EINVAL : -ENOENT;
-	}
-	snprintf(buf, size, "%s", e->link);
-	meta_free_index(&idx);
-	return 0;
+	return meta_readlink(parent, name, buf, size);
 }
 
 static int omdfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -341,13 +312,9 @@ static int omdfs_rmdir(const char *path)
 	omdfs_split_path(path, parent, name);
 
 	/* Refuse a non-empty directory (the index is the source of truth). */
-	struct omdfs_index idx;
-	if (meta_get_index(path, &idx) == 0) {
-		size_t n = idx.n;
-		meta_free_index(&idx);
-		if (n > 0)
-			return -ENOTEMPTY;
-	}
+	size_t n;
+	if (meta_dir_stat(path, NULL, &n) == 0 && n > 0)
+		return -ENOTEMPTY;
 
 	int r = meta_remove_entry(parent, name);
 	if (r != 0)
@@ -376,14 +343,10 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 
 	/* For a file, make sure its content is cached so it lives at the new cache
 	 * path and stays readable before the backend rename syncs. */
-	struct omdfs_index idx;
+	uint8_t ftype = 0;
 	int isfile = 0;
-	if (meta_get_index(fp, &idx) == 0) {
-		struct omdfs_entry *e = meta_lookup(&idx, fn);
-		if (e)
-			isfile = (e->type == OMDFS_T_FILE);
-		meta_free_index(&idx);
-	}
+	if (meta_stat(fp, fn, NULL, &ftype, NULL) == 0)
+		isfile = (ftype == OMDFS_T_FILE);
 	if (isfile)
 		content_prefetch(from); /* best-effort */
 

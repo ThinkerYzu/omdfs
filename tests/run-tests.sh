@@ -328,6 +328,35 @@ rmdir "$MNT/rc"
 mkdir "$MNT/rc"
 assert_eq "recreated dir is empty (no stale cached child)" "" "$(ls -A "$MNT/rc")"
 
+# ============================================================
+# Large-directory lookup — exercise the O(1) name-hash path (>= META_HASH_MIN
+# entries) on the single-entry read APIs, and its invalidation on mutation.
+# ============================================================
+mkdir "$MNT/big"
+N=200
+for i in $(seq 1 $N); do echo "v$i" > "$MNT/big/f$i.txt"; done
+assert_eq "large dir lists all entries" "$N" "$(ls "$MNT/big" | wc -l)"
+# Hashed single-entry getattr/read at the ends and middle of the table.
+assert_eq "hashed lookup: first entry"  "v1"   "$(cat "$MNT/big/f1.txt")"
+assert_eq "hashed lookup: middle entry" "v100" "$(cat "$MNT/big/f100.txt")"
+assert_eq "hashed lookup: last entry"   "v200" "$(cat "$MNT/big/f200.txt")"
+assert_failure "hashed lookup: absent entry is ENOENT" test -e "$MNT/big/nope.txt"
+# Remove -> hash invalidated + rebuilt without the victim; neighbors still hit.
+rm "$MNT/big/f100.txt"
+assert_failure "removed entry gone after hash rebuild" test -e "$MNT/big/f100.txt"
+assert_eq "neighbor still resolves after removal" "v101" "$(cat "$MNT/big/f101.txt")"
+# In-dir rename -> in-place name change invalidates the hash.
+mv "$MNT/big/f200.txt" "$MNT/big/renamed.txt"
+assert_failure "old name gone after in-dir rename" test -e "$MNT/big/f200.txt"
+assert_eq "new name resolves after in-dir rename" "v200" "$(cat "$MNT/big/renamed.txt")"
+# Add -> hash invalidated; the new and the existing keys both resolve.
+echo fresh > "$MNT/big/added.txt"
+assert_eq "added entry resolves" "fresh" "$(cat "$MNT/big/added.txt")"
+assert_eq "existing entry still resolves after add" "v1" "$(cat "$MNT/big/f1.txt")"
+# Hashed readlink in a large directory.
+ln -sf f1.txt "$MNT/big/sl"
+assert_eq "hashed readlink target" "f1.txt" "$(readlink "$MNT/big/sl")"
+
 # ---- summary ----
 echo "1..$COUNT"
 if [ "$FAIL" -ne 0 ]; then

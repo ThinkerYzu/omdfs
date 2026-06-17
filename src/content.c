@@ -230,24 +230,15 @@ int content_open(const char *fuse_path, struct content_handle **out)
 	omdfs_split_path(fuse_path, parent, name);
 
 	/* Consult the index for cache state and the expected size. */
-	int cached;
-	off_t size;
-	struct omdfs_index idx;
-	int r = meta_get_index(parent, &idx);
+	struct stat est;
+	uint8_t etype, eflags;
+	int r = meta_stat(parent, name, &est, &etype, &eflags);
 	if (r != 0)
 		return r;
-	struct omdfs_entry *e = meta_lookup(&idx, name);
-	if (!e) {
-		meta_free_index(&idx);
-		return -ENOENT;
-	}
-	if (e->type == OMDFS_T_DIR) {
-		meta_free_index(&idx);
+	if (etype == OMDFS_T_DIR)
 		return -EISDIR;
-	}
-	cached = (e->flags & OMDFS_F_CONTENT_CACHED) != 0;
-	size = e->st.st_size;
-	meta_free_index(&idx);
+	int cached = (eflags & OMDFS_F_CONTENT_CACHED) != 0;
+	off_t size = est.st_size;
 
 	char cp[PATH_MAX];
 	cache_path(cp, fuse_path);
