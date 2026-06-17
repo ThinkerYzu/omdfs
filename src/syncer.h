@@ -23,6 +23,14 @@ int syncer_start(void);
 /* Wake the thread to sync now (called after each foreground mutation). */
 void syncer_kick(void);
 
+/* Stamp the foreground-activity beacon. Called at the top of every FUSE op so the
+ * background syncer can back off (defer its cycle) while the foreground is actively
+ * using the mount, instead of contending for meta_mtx and slowing every op. Cheap
+ * and lock-free (a relaxed atomic store of the monotonic clock); safe to call from
+ * any thread on the per-block read/write path. Tuned by OMDFS_SYNC_BACKOFF_MS
+ * (default 2000 ms; 0 disables backoff). */
+void syncer_note_activity(void);
+
 /* Signal the thread to stop, run a final drain, and join it. */
 void syncer_stop(void);
 

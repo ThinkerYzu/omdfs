@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,49 @@
 #define SYNC_INTERVAL_MS 700
 #define COPY_BUF (128 * 1024)
 #define DRAIN_MAX 8 /* final-drain cycles attempted on clean unmount */
+
+/* ---- foreground-activity backoff ----
+ *
+ * The syncer and the FUSE worker threads share one meta_mtx; a sync cycle takes it
+ * repeatedly (per-dir idx_copy in meta_try_load, the cold sweep), so while a cycle
+ * runs every foreground getattr/readdir/lookup queues behind it. To keep the
+ * foreground responsive the syncer backs off: each FUSE op stamps a monotonic
+ * beacon, and the syncer defers its cycle while the beacon is fresh, draining only
+ * once the foreground goes quiet. Deferral is capped so a sustained workload still
+ * syncs, and skipped under backpressure so a near-full cache drains promptly. */
+#define ACTIVITY_BACKOFF_MS 2000   /* default backoff slice while foreground busy */
+#define ACTIVITY_QUIET_MS 250	   /* foreground is "idle" after this gap with no op */
+#define ACTIVITY_MAX_DEFER_MS 10000 /* never hold a cycle back longer than this */
+
+/* CLOCK_MONOTONIC ms of the last foreground FUSE op (0 = none yet). Written
+ * lock-free from FUSE worker threads, read by the syncer thread. */
+static atomic_llong s_last_activity_ms;
+
+/* Backoff slice in ms (OMDFS_SYNC_BACKOFF_MS); 0 disables the backoff entirely.
+ * Read once at syncer_start. */
+static long s_backoff_ms = ACTIVITY_BACKOFF_MS;
+
+static long long mono_ms(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+void syncer_note_activity(void)
+{
+	atomic_store_explicit(&s_last_activity_ms, mono_ms(), memory_order_relaxed);
+}
+
+/* ms since the last foreground op, or -1 if none has happened yet. */
+static long long activity_idle_ms(void)
+{
+	long long last = atomic_load_explicit(&s_last_activity_ms,
+					      memory_order_relaxed);
+	if (last == 0)
+		return -1;
+	return mono_ms() - last;
+}
 
 /* ---- thread control ---- */
 
@@ -998,27 +1042,57 @@ static void sync_once(struct omdfs_status *st)
 	snprintf(st->last_mark, sizeof(st->last_mark), "%s", s_last_mark);
 }
 
+/* Wait up to `ms` on s_cond (s_lock held). Wakes early on kick/stop signal. */
+static void cond_timedwait_ms(long ms)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	long ns = ts.tv_nsec + (ms % 1000) * 1000000L;
+	ts.tv_sec += ms / 1000 + ns / 1000000000L;
+	ts.tv_nsec = ns % 1000000000L;
+	pthread_cond_timedwait(&s_cond, &s_lock, &ts);
+}
+
 static void *syncer_loop(void *arg)
 {
 	(void)arg;
+	long long defer_start = 0; /* mono ms a held-back cycle first deferred (0 = not) */
+	int first_cycle = 1; /* the baseline-status / recovery cycle never backs off */
 	for (;;) {
 		pthread_mutex_lock(&s_lock);
-		if (!s_stop && !s_kick) {
-			struct timespec ts;
-			clock_gettime(CLOCK_REALTIME, &ts);
-			long ns = ts.tv_nsec +
-				  (SYNC_INTERVAL_MS % 1000) * 1000000L;
-			ts.tv_sec += SYNC_INTERVAL_MS / 1000 + ns / 1000000000L;
-			ts.tv_nsec = ns % 1000000000L;
-			pthread_cond_timedwait(&s_cond, &s_lock, &ts);
-		}
+		if (!s_stop && !s_kick)
+			cond_timedwait_ms(SYNC_INTERVAL_MS);
 		int stop = s_stop;
+
+		/* Foreground-activity backoff: if a FUSE op happened in the last
+		 * quiet window and we aren't stopping or relieving backpressure,
+		 * defer this cycle (bounded) rather than contend for meta_mtx. The
+		 * first cycle is exempt: it publishes the baseline status and runs
+		 * crash recovery, neither of which should wait on foreground I/O. */
+		if (!first_cycle && !stop && s_backoff_ms > 0 && !evict_pressure()) {
+			long long idle = activity_idle_ms();
+			if (idle >= 0 && idle < ACTIVITY_QUIET_MS) {
+				long long now = mono_ms();
+				if (defer_start == 0)
+					defer_start = now;
+				if (now - defer_start < ACTIVITY_MAX_DEFER_MS) {
+					/* sleep a slice (still wakes on stop),
+					 * then re-evaluate without syncing */
+					cond_timedwait_ms(s_backoff_ms);
+					pthread_mutex_unlock(&s_lock);
+					continue;
+				}
+				/* deferral cap reached: sync now despite the load */
+			}
+		}
+		defer_start = 0;
 		s_kick = 0;
 		pthread_mutex_unlock(&s_lock);
 
 		struct omdfs_status st;
 		sync_once(&st);
 		status_publish(&st);
+		first_cycle = 0;
 		if (stop)
 			break;
 	}
@@ -1027,6 +1101,13 @@ static void *syncer_loop(void *arg)
 
 int syncer_start(void)
 {
+	const char *b = getenv("OMDFS_SYNC_BACKOFF_MS");
+	if (b && *b) {
+		char *end;
+		long v = strtol(b, &end, 10);
+		if (*end == '\0' && v >= 0)
+			s_backoff_ms = v; /* 0 = disable backoff */
+	}
 	pool_start(); /* parallel copy workers, used from the first cycle on */
 	if (pthread_create(&s_thread, NULL, syncer_loop, NULL) != 0) {
 		pool_stop();
@@ -1038,6 +1119,12 @@ int syncer_start(void)
 
 void syncer_kick(void)
 {
+	/* Every kick comes from a foreground op (a mutation, release, or fsync), so
+	 * it doubles as an activity stamp — the read-only ops (getattr/readdir/…)
+	 * that don't kick stamp the beacon directly. This lets a write burst batch:
+	 * the kick asks to sync, but the fresh beacon makes the syncer back off and
+	 * drain the burst together once it quiesces. */
+	syncer_note_activity();
 	pthread_mutex_lock(&s_lock);
 	s_kick = 1;
 	pthread_cond_signal(&s_cond);

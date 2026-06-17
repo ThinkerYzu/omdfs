@@ -119,6 +119,7 @@ static int omdfs_getattr(const char *path, struct stat *st,
 			 struct fuse_file_info *fi)
 {
 	(void)fi;
+	syncer_note_activity();
 
 	if (path[0] == '/' && path[1] == '\0') {
 		/* Serve the root's own attributes from the local index (its
@@ -138,6 +139,7 @@ static int omdfs_getattr(const char *path, struct stat *st,
 
 static int omdfs_readlink(const char *path, char *buf, size_t size)
 {
+	syncer_note_activity();
 	char parent[PATH_MAX], name[PATH_MAX];
 	omdfs_split_path(path, parent, name);
 
@@ -151,6 +153,7 @@ static int omdfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	(void)offset;
 	(void)fi;
 	(void)flags;
+	syncer_note_activity();
 
 	struct omdfs_index idx;
 	int r = meta_get_index(path, &idx);
@@ -175,6 +178,7 @@ static int omdfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 static int omdfs_open(const char *path, struct fuse_file_info *fi)
 {
+	syncer_note_activity();
 	struct content_handle *h;
 	int r;
 	if ((fi->flags & O_ACCMODE) == O_RDONLY) {
@@ -194,6 +198,7 @@ static int omdfs_read(const char *path, char *buf, size_t size, off_t offset,
 		      struct fuse_file_info *fi)
 {
 	(void)path;
+	syncer_note_activity();
 	struct content_handle *h = (struct content_handle *)(uintptr_t)fi->fh;
 	ssize_t n = content_read(h, buf, size, offset);
 	return (int)n; /* already bytes-read or -errno */
@@ -203,6 +208,7 @@ static int omdfs_write(const char *path, const char *buf, size_t size,
 		       off_t offset, struct fuse_file_info *fi)
 {
 	(void)path;
+	syncer_note_activity();
 	struct content_handle *h = (struct content_handle *)(uintptr_t)fi->fh;
 	ssize_t n = content_write(h, buf, size, offset);
 	return (int)n;
