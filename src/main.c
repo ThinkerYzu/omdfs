@@ -504,6 +504,10 @@ static void usage(const char *prog)
 		"  --backend <dir>     already-mounted network FS to cache (sshfs/nfs/...)\n"
 		"  --datadir <dir>     local cache/journal/state directory\n"
 		"  --cache-size <sz>   cache budget; accepts K/M/G suffix (0 = unlimited)\n"
+		"  --no-flush          start with the dirty content/attr flush paused\n"
+		"                      (creates <datadir>/state/flush-off). Structural ops\n"
+		"                      still sync. Resume with: rm <datadir>/state/flush-off;\n"
+		"                      pause a running mount with: touch <datadir>/state/flush-off\n"
 		"  --resync            push the whole cache (content + metadata) to the\n"
 		"                      backend so it matches the cache, then exit; no mount.\n"
 		"                      Run while unmounted. Reports a summary on stderr.\n"
@@ -538,6 +542,18 @@ static off_t parse_size(const char *s)
 	if (*end != '\0')
 		return -1;
 	return (off_t)v * mult;
+}
+
+/* Parse a boolean config value. Returns 1/0, or -1 if unrecognized. */
+static int parse_bool(const char *s)
+{
+	if (!strcmp(s, "1") || !strcmp(s, "true") || !strcmp(s, "yes") ||
+	    !strcmp(s, "on"))
+		return 1;
+	if (!strcmp(s, "0") || !strcmp(s, "false") || !strcmp(s, "no") ||
+	    !strcmp(s, "off"))
+		return 0;
+	return -1;
 }
 
 /* Trim leading/trailing ASCII whitespace in place; returns the first non-blank. */
@@ -596,6 +612,15 @@ static int load_config_file(const char *path)
 				break;
 			}
 			g_cfg.cache_budget = sz;
+		} else if (!strcmp(key, "no-flush") || !strcmp(key, "no_flush")) {
+			int b = parse_bool(val);
+			if (b < 0) {
+				fprintf(stderr, "omdfs: %s:%d: bad no-flush: %s\n",
+					path, lineno, val);
+				rc = -1;
+				break;
+			}
+			g_cfg.no_flush = b;
 		} else {
 			fprintf(stderr, "omdfs: %s:%d: unknown key: %s\n", path,
 				lineno, key);
@@ -655,6 +680,8 @@ static int parse_args(int argc, char **argv, int *out_argc, char **out_argv)
 			g_cfg.resync = 1;
 		else if (!strcmp(argv[i], "--mark-dirty"))
 			g_cfg.mark_dirty = 1;
+		else if (!strcmp(argv[i], "--no-flush"))
+			g_cfg.no_flush = 1;
 		else
 			out_argv[oc++] = argv[i];
 	}
@@ -720,6 +747,23 @@ int main(int argc, char **argv)
 		int rc = syncer_mark_dirty();
 		free(fuse_argv);
 		return rc;
+	}
+	/* --no-flush: start with the dirty content/attr flush paused by pre-creating
+	 * the state/flush-off control file. The syncer checks this file every cycle;
+	 * the operator resumes flushing at any time with `rm <datadir>/state/flush-off`.
+	 * (The file persists across mounts — an explicit operator intent to hold back
+	 * backend writes survives a remount until it is removed.) */
+	if (g_cfg.no_flush) {
+		char fp[PATH_MAX];
+		snprintf(fp, sizeof(fp), "%s/state/flush-off", g_cfg.datadir);
+		int fd = open(fp, O_WRONLY | O_CREAT, 0644);
+		if (fd < 0) {
+			fprintf(stderr, "omdfs: cannot create %s: %s\n", fp,
+				strerror(errno));
+			free(fuse_argv);
+			return 1;
+		}
+		close(fd);
 	}
 	/* Seed the cache-size accounting from content already on disk and arm the
 	 * evictor (no-op when --cache-size is 0/unset). */

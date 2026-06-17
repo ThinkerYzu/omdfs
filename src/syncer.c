@@ -384,16 +384,25 @@ static void phase_structural(struct omdfs_status *st)
  * leave it dirty and account the still-pending backlog + re-arm its directory
  * (failure). Runs on a pool worker, so all shared-state touches are thread-safe:
  * meta_mark_flags / dirtyset_add are internally locked, the status counters are
- * guarded by s_stat_mtx. */
+ * guarded by s_stat_mtx.
+ *
+ * When `dry` is set (the flush is paused via state/flush-off) we never touch the
+ * backend and never clear the flags: we just count the entry into the backlog and
+ * re-arm its directory, exactly as the failure path does — so the status stays
+ * honest about what is waiting and the dirty-set is preserved for when flushing
+ * resumes. A dry entry always runs inline (flush_submit never hands it to the
+ * pool), so `dry` is read only on the syncer thread. */
 static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
-			struct omdfs_status *st)
+			struct omdfs_status *st, int dry)
 {
 	char fpath[PATH_MAX], bp[PATH_MAX];
 	join_path(fpath, fuse_dir, e->name);
 	backend_path(bp, fpath);
 
-	int ok = 1;
-	if (e->flags & OMDFS_F_DIRTY_CONTENT) {
+	int ok = dry ? 0 : 1; /* dry: treat as "not pushed" -> count + re-arm */
+	if (dry) {
+		/* no backend I/O, no flag clearing */
+	} else if (e->flags & OMDFS_F_DIRTY_CONTENT) {
 		char cp[PATH_MAX];
 		cache_path(cp, fpath);
 		if (copy_file(cp, bp) == 0)
@@ -429,7 +438,7 @@ struct flush_arg {
 static void flush_worker(void *p)
 {
 	struct flush_arg *a = p;
-	flush_entry(a->dir, &a->e, a->st);
+	flush_entry(a->dir, &a->e, a->st, 0);
 	free(a->dir);
 	free(a->e.name);
 	free(a->e.link);
@@ -438,10 +447,15 @@ static void flush_worker(void *p)
 
 /* Hand one dirty entry to the pool (deep-copying what the worker needs, since the
  * loaded index is freed as soon as the producer returns). Falls back to flushing
- * inline if the copy can't be allocated. */
+ * inline if the copy can't be allocated. A dry (paused) flush does no backend I/O
+ * and runs inline — no need to deep-copy or wake a worker. */
 static void flush_submit(const char *fuse_dir, const struct omdfs_entry *e,
-			 struct omdfs_status *st)
+			 struct omdfs_status *st, int dry)
 {
+	if (dry) {
+		flush_entry(fuse_dir, e, st, 1);
+		return;
+	}
 	struct flush_arg *a = malloc(sizeof(*a));
 	if (a) {
 		a->dir = strdup(fuse_dir);
@@ -458,29 +472,29 @@ static void flush_submit(const char *fuse_dir, const struct omdfs_entry *e,
 		free(a->e.link);
 		free(a);
 	}
-	flush_entry(fuse_dir, e, st); /* OOM: just do it here */
+	flush_entry(fuse_dir, e, st, 0); /* OOM: just do it here */
 }
 
 /* Submit every dirty entry of an already-loaded index to the pool. */
 static void flush_loaded(const char *fuse_dir, struct omdfs_index *idx,
-			 struct omdfs_status *st)
+			 struct omdfs_status *st, int dry)
 {
 	for (size_t i = 0; i < idx->n; i++) {
 		struct omdfs_entry *e = &idx->entries[i];
 		if (!(e->flags & (OMDFS_F_DIRTY_CONTENT | OMDFS_F_DIRTY_ATTR)))
 			continue;
-		flush_submit(fuse_dir, e, st);
+		flush_submit(fuse_dir, e, st, dry);
 	}
 }
 
 /* Submit one directory's own dirty entries (non-recursive). A removed/uncached
  * directory has nothing to flush. */
-static void flush_one_dir(const char *fuse_dir, struct omdfs_status *st)
+static void flush_one_dir(const char *fuse_dir, struct omdfs_status *st, int dry)
 {
 	struct omdfs_index idx;
 	if (meta_try_load(fuse_dir, &idx) != 0)
 		return;
-	flush_loaded(fuse_dir, &idx, st);
+	flush_loaded(fuse_dir, &idx, st, dry);
 	meta_free_index(&idx);
 }
 
@@ -488,20 +502,20 @@ static void flush_one_dir(const char *fuse_dir, struct omdfs_status *st)
  * Used on the first cycle (dirty flags survive a crash but the in-memory set
  * starts empty) and whenever the set asks for a full rescan. A directory that
  * can't be fully flushed is re-recorded by the worker (flush_entry on failure). */
-static void flush_tree(const char *fuse_dir, struct omdfs_status *st)
+static void flush_tree(const char *fuse_dir, struct omdfs_status *st, int dry)
 {
 	struct omdfs_index idx;
 	if (meta_try_load(fuse_dir, &idx) != 0)
 		return; /* not a cached directory */
 
-	flush_loaded(fuse_dir, &idx, st);
+	flush_loaded(fuse_dir, &idx, st, dry);
 
 	for (size_t i = 0; i < idx.n; i++) {
 		if (idx.entries[i].type != OMDFS_T_DIR)
 			continue;
 		char child[PATH_MAX];
 		join_path(child, fuse_dir, idx.entries[i].name);
-		flush_tree(child, st);
+		flush_tree(child, st, dry);
 	}
 	meta_free_index(&idx);
 }
@@ -510,21 +524,26 @@ static void flush_tree(const char *fuse_dir, struct omdfs_status *st)
  * visits only the recorded dirty directories (dirtyset); on the initial cycle or
  * after a set overflow it falls back to a full tree walk that also re-seeds the
  * set. Blocks until every submitted flush has finished (so the backlog counters
- * and any failure re-arming are complete before the cycle ends). */
-static void flush_pending(struct omdfs_status *st)
+ * and any failure re-arming are complete before the cycle ends).
+ *
+ * When `dry` is set the flush is paused (state/flush-off): the same discovery runs
+ * but nothing is pushed and no flag is cleared — each visited dirty entry is only
+ * counted into the backlog and re-armed in the dirty-set (so the set survives the
+ * dirtyset_take here and the work resumes intact once flushing is re-enabled). */
+static void flush_pending(struct omdfs_status *st, int dry)
 {
 	size_t n;
 	int full;
 	char **dirs = dirtyset_take(&n, &full);
 	if (full) {
 		dirtyset_free(dirs, n); /* the walk rediscovers everything */
-		flush_tree("/", st);
+		flush_tree("/", st, dry);
 	} else {
 		for (size_t i = 0; i < n; i++)
-			flush_one_dir(dirs[i], st);
+			flush_one_dir(dirs[i], st, dry);
 		dirtyset_free(dirs, n);
 	}
-	pool_drain();
+	pool_drain(); /* dry: nothing was submitted, so this is a no-op */
 }
 
 /* ---- full resync (operator-triggered reconcile) ---- */
@@ -918,6 +937,22 @@ static void maybe_cold_meta_sweep(struct omdfs_status *st)
 	st->cold_evicted = s_cold_evicted_total;
 }
 
+/* ---- pause the dirty flush (state/flush-off) ---- */
+
+/* The operator pauses the dirty content/attr flush by creating DATADIR/state/flush-off
+ * (`touch`); removing it resumes. Unlike the one-shot triggers this is a persistent
+ * toggle — its mere presence, re-checked at the top of every cycle, gates phase 2.
+ * The cheap structural WAL drain keeps running, so the backend namespace stays
+ * coherent; only the network-heavy per-file content/attr push is held back. The
+ * cache stays authoritative, so nothing is lost — the backend just lags until the
+ * file is removed. `--no-flush` pre-creates this file so a mount can start paused. */
+static int flush_disabled(void)
+{
+	char tp[PATH_MAX];
+	snprintf(tp, sizeof(tp), "%s/state/flush-off", g_cfg.datadir);
+	return access(tp, F_OK) == 0;
+}
+
 /* ---- cycle + thread ---- */
 
 /* Run one full sync cycle and fill `st` with the resulting backlog/health so the
@@ -929,8 +964,11 @@ static void sync_once(struct omdfs_status *st)
 	maybe_live_resync(); /* operator-triggered full reconcile, on this thread */
 	maybe_live_mark_dirty(); /* operator-triggered non-blocking re-push */
 
+	int dry = flush_disabled(); /* state/flush-off: pause phase 2, still count it */
+	st->flush_disabled = dry;
+
 	phase_structural(st); /* backend dirs/files exist before content flush */
-	flush_pending(st);
+	flush_pending(st, dry);
 
 	/* Flushed content is now clean and may be reclaimed; this also refreshes
 	 * the backpressure flag (clears it once dirty data has drained). */

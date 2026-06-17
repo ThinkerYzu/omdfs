@@ -146,6 +146,31 @@ touch ~/.omdfs/data/state/cold-evict
 `OMDFS_COLD_META=0`/`1` disables/forces it regardless of the budget; the count
 reclaimed since mount is reported in `state/status` as `cold-meta-evicted`.
 
+### Pausing the background flush
+
+To hold back the dirty content/attribute push to the backend — e.g. during backend
+maintenance, or to stop hammering a slow/flaky remote — pause the flush:
+
+```bash
+# pause a running mount
+touch ~/.omdfs/data/state/flush-off
+
+# resume
+rm ~/.omdfs/data/state/flush-off
+
+# or boot a mount already paused
+omdfs --no-flush --backend /mnt/nas --datadir ~/.omdfs/data /mnt/omdfs
+```
+
+While the file is present the syncer skips phase 2 (the network-heavy per-file
+content/attr copy); local writes still succeed and the cache stays authoritative,
+so nothing is lost — the backend just lags, and the held-back work drains once the
+file is removed. The **cheap structural ops** (create/mkdir/unlink/rmdir/rename/
+symlink) keep syncing, so the backend namespace stays coherent. `state/status`
+reports `flush: disabled` and an overall `state: flush-paused`, with the still-
+accurate `dirty-files`/`dirty-bytes` backlog. `--no-flush` (config key `no-flush =
+on`) just pre-creates the control file, which persists across mounts until removed.
+
 ## Tests
 
 ```bash

@@ -31,6 +31,12 @@
 #                      cache dir rmdir'd, yet the directory stays listable (rebuilt from
 #                      the backend) and its files re-fetch correctly. A directory with a
 #                      dirty (un-synced) child keeps its index.
+#   L. flush pause  — pausing the dirty flush (state/flush-off, or --no-flush at mount)
+#                      holds back the content/attr push to the backend while the local
+#                      write still succeeds; the status reports flush: disabled / state:
+#                      flush-paused with a non-zero dirty backlog; removing the file
+#                      resumes flushing and the backlog drains. Structural ops keep
+#                      syncing while paused.
 #
 # Usage: tests/hardening.sh [path-to-omdfs-binary]   (default: ./omdfs)
 
@@ -448,6 +454,78 @@ kswept="$(status_field "$K/data" cold-meta-evicted)"
 	&& ok "status reports the cold-meta-evicted count ($kswept)" \
 	|| no "status reports the cold-meta-evicted count (got '$kswept')"
 fusermount3 -u "$K/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
+
+# ============================================================
+# L. flush pause holds back the content flush; resume drains it
+# ============================================================
+# With the backend reachable, a baseline write must sync. Then pause the flush via
+# state/flush-off and overwrite that file: the new content stays in the cache and
+# must NOT reach the backend (the old content is still there), the status reports
+# flush: disabled / state: flush-paused with a non-zero dirty backlog, and a
+# structural op (mkdir) still propagates. Removing the file resumes flushing and the
+# held-back content drains. (Overwriting an already-synced file isolates the content
+# flush from the structural create, which keeps syncing while paused.)
+L="$WORK/l"; mkdir -p "$L/backend" "$L/data" "$L/mnt"
+if ! mount_omdfs "$L/mnt" "$L/omdfs.log" --backend "$L/backend" --datadir "$L/data"; then
+	echo "Bail out! omdfs failed to mount (L); log follows:" >&2; cat "$L/omdfs.log" >&2; exit 98
+fi
+echo baseline > "$L/mnt/base"
+lbase() { [ "$(cat "$L/backend/base" 2>/dev/null)" = baseline ]; }
+wait_for "baseline write syncs to the backend before pausing" lbase
+
+touch "$L/data/state/flush-off"                  # operator pauses the dirty flush
+echo updated > "$L/mnt/base"                      # local content change succeeds...
+[ "$(cat "$L/mnt/base")" = updated ] \
+	&& ok "write succeeds locally while the flush is paused" \
+	|| no "write succeeds locally while the flush is paused"
+lpaused() { [ "$(status_field "$L/data" flush)" = disabled ]; }
+wait_for "status reports flush: disabled while paused" lpaused
+lstate() { [ "$(status_field "$L/data" state)" = flush-paused ]; }
+wait_for "status overall state is flush-paused" lstate
+ldirty() { [ "$(status_field "$L/data" dirty-files)" -ge 1 ] 2>/dev/null; }
+wait_for "status surfaces a non-zero dirty backlog while paused" ldirty
+sleep 1.5                                          # give the syncer cycles to (not) push
+[ "$(cat "$L/backend/base" 2>/dev/null)" = baseline ] \
+	&& ok "paused flush does not push held content to the backend" \
+	|| no "paused flush does not push held content to the backend"
+# Structural ops keep syncing while the content flush is paused.
+mkdir "$L/mnt/sdir"
+lstruct() { [ -d "$L/backend/sdir" ]; }
+wait_for "structural ops still sync while the flush is paused" lstruct
+
+rm -f "$L/data/state/flush-off"                   # operator resumes flushing
+lheld() { [ "$(cat "$L/backend/base" 2>/dev/null)" = updated ]; }
+wait_for "removing state/flush-off resumes the flush and drains the backlog" lheld
+lresumed() { [ "$(status_field "$L/data" flush)" = enabled ]; }
+wait_for "status reports flush: enabled after resuming" lresumed
+fusermount3 -u "$L/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
+
+# ============================================================
+# M. --no-flush boots a mount already paused
+# ============================================================
+# The boot flag pre-creates state/flush-off so a mount starts with the flush paused:
+# the control file is present, status reports flush: disabled, and a file's content
+# does not reach the backend until the operator removes the file. (The structural
+# create still propagates, so the backend file may exist empty; we assert on its
+# content, which is what the flush carries.)
+M="$WORK/m"; mkdir -p "$M/backend" "$M/data" "$M/mnt"
+if ! mount_omdfs "$M/mnt" "$M/omdfs.log" --backend "$M/backend" --datadir "$M/data" --no-flush; then
+	echo "Bail out! omdfs failed to mount (M); log follows:" >&2; cat "$M/omdfs.log" >&2; exit 98
+fi
+[ -e "$M/data/state/flush-off" ] \
+	&& ok "--no-flush creates the state/flush-off control file" \
+	|| no "--no-flush creates the state/flush-off control file"
+mnoflush() { [ "$(status_field "$M/data" flush)" = disabled ]; }
+wait_for "--no-flush mount reports flush: disabled" mnoflush
+echo boot > "$M/mnt/bootfile"
+sleep 1.5
+[ "$(cat "$M/backend/bootfile" 2>/dev/null)" != boot ] \
+	&& ok "--no-flush holds back content from the backend at boot" \
+	|| no "--no-flush holds back content from the backend at boot"
+rm -f "$M/data/state/flush-off"
+mdrains() { [ "$(cat "$M/backend/bootfile" 2>/dev/null)" = boot ]; }
+wait_for "removing the file resumes flushing on a --no-flush mount" mdrains
+fusermount3 -u "$M/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
 
 # ---- summary ----
 echo "1..$COUNT"

@@ -45,6 +45,8 @@ static const char *overall(const struct omdfs_status *s)
 		return "stuck";
 	if (s->backpressure)
 		return "backpressure";
+	if (s->flush_disabled)
+		return "flush-paused";
 	if (s->pending_structural || s->dirty_files)
 		return "syncing";
 	return "ok";
@@ -98,6 +100,7 @@ void status_publish(const struct omdfs_status *s)
 		"cache-budget: %lld\n"
 		"cache-hard-limit: %lld\n"
 		"backpressure: %s\n"
+		"flush: %s\n"
 		"stuck: %s\n"
 		"stuck-op: %s\n"
 		"stuck-path: %s\n"
@@ -111,6 +114,7 @@ void status_publish(const struct omdfs_status *s)
 		s->pending_structural, s->dirty_files, s->dirty_bytes,
 		s->cache_bytes, s->cache_budget, s->cache_hard_limit,
 		s->backpressure ? "yes" : "no",
+		s->flush_disabled ? "disabled" : "enabled",
 		s->stuck ? "yes" : "no",
 		stuck_op, stuck_path, errbuf, resync_s, resync_res,
 		mark_s, mark_res, s->cold_evicted);

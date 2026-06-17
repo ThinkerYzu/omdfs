@@ -27,6 +27,7 @@ struct omdfs_status {
 	long long cache_budget;    /* --cache-size (0 = unlimited) */
 	long long cache_hard_limit; /* backpressure ceiling (0 = unlimited) */
 	int backpressure;          /* 1 = cache full of un-evictable dirty data; writes get ENOSPC */
+	int flush_disabled;        /* 1 = dirty content/attr flush is paused (state/flush-off present) */
 	int stuck;                 /* 1 = head structural op is failing permanently */
 	int stuck_errno;           /* errno of the stuck/blocked op (0 if none) */
 	char stuck_op[16];         /* op name of the stuck/blocked op ("" if none) */

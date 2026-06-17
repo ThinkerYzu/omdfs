@@ -16,6 +16,7 @@ struct omdfs_config {
 	off_t cache_budget; /* cache size limit in bytes; 0 = unlimited (no eviction) */
 	int resync; /* --resync: reconcile cache → backend, then exit (no mount) */
 	int mark_dirty; /* --mark-dirty: flag whole cache dirty, then exit (no mount) */
+	int no_flush; /* --no-flush: start with the dirty flush paused (creates state/flush-off) */
 };
 
 extern struct omdfs_config g_cfg;
