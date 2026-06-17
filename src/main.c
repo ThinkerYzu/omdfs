@@ -357,6 +357,7 @@ static int omdfs_rmdir(const char *path)
 	snprintf(ip, sizeof(ip), "%s/%s", cp, OMDFS_INDEX_NAME);
 	unlink(ip);
 	rmdir(cp); /* best-effort */
+	meta_forget(path); /* the removed dir's own cached index is now stale */
 	wal_append(WAL_RMDIR, path, NULL);
 	syncer_kick();
 	return 0;
@@ -402,6 +403,10 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	 * already re-flags the destination parent if the moved entry itself is dirty.) */
 	dirtyset_rename(from, to);
 	evict_rename(from, to);
+	/* A renamed directory's on-disk cache subtree (its own + descendants'
+	 * .omdfs.dir files) moved to new paths; drop the now stale-keyed cached
+	 * indexes so they reparse from the moved files. (No-op for a file.) */
+	meta_forget_tree(from);
 	wal_append(WAL_RENAME, from, to);
 	syncer_kick();
 	return 0;

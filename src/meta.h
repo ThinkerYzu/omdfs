@@ -94,6 +94,15 @@ enum meta_field {
 int meta_set(const char *fuse_dir, const char *name, const struct stat *src,
 	     unsigned fields, uint8_t dirty);
 
+/* Drop the cached parsed index for `fuse_dir`, if any (next access reparses it
+ * from disk). Call when a directory's on-disk index is removed (rmdir). */
+void meta_forget(const char *fuse_dir);
+
+/* Drop the cached parsed indexes for `prefix` and everything beneath it. Call
+ * after renaming a directory: its cached subtree is now keyed by stale paths
+ * (the on-disk cache subtree has moved). */
+void meta_forget_tree(const char *prefix);
+
 /* Release an index loaded by meta_get_index(). */
 void meta_free_index(struct omdfs_index *idx);
 

@@ -299,6 +299,35 @@ mv "$BACKEND" "$WORK/backend.gone2"
 assert_success "root getattr served locally with backend gone" stat "$MNT"
 mv "$WORK/backend.gone2" "$BACKEND"
 
+# --- metadata-index cache coherence ---
+# The per-directory index is cached parsed-in-memory; these check the cache stays
+# coherent across the namespace ops that re-key or drop it. All ops run purely
+# through the local cache (no backend round-trip needed for the assertion).
+#
+# Path reuse after rename is the case a stale cache would get WRONG: list a dir
+# (caching its index under "/ca"), rename it away, then move a DIFFERENT dir onto
+# the now-freed "/ca". Listing "/ca" must show the new occupant's children, not
+# the cached old ones — i.e. rename must drop the stale-keyed cached subtree.
+mkdir -p "$MNT/ca" "$MNT/cb"
+echo old > "$MNT/ca/inca.txt"
+echo new > "$MNT/cb/incb.txt"
+ls "$MNT/ca" >/dev/null                  # populate the "/ca" cached index
+mv "$MNT/ca" "$MNT/ca_old"               # rename away -> drop stale "/ca" subtree
+mv "$MNT/cb" "$MNT/ca"                    # reuse the freed path with new contents
+assert_success "reused path shows the new dir's child" test -f "$MNT/ca/incb.txt"
+assert_failure "reused path does not show the old cached child" \
+	test -e "$MNT/ca/inca.txt"
+
+# rmdir then recreate the same path must yield a fresh, empty directory (the
+# removed dir's cached index is dropped; the new one is published empty).
+mkdir "$MNT/rc"
+echo a > "$MNT/rc/a.txt"
+ls "$MNT/rc" >/dev/null                   # cache "/rc" = {a.txt}
+rm "$MNT/rc/a.txt"
+rmdir "$MNT/rc"
+mkdir "$MNT/rc"
+assert_eq "recreated dir is empty (no stale cached child)" "" "$(ls -A "$MNT/rc")"
+
 # ---- summary ----
 echo "1..$COUNT"
 if [ "$FAIL" -ne 0 ]; then
