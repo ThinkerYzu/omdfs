@@ -323,6 +323,72 @@ hres="$(status_field "$H/data" last-resync-result)"
 	&& ok "status reports the last-resync result ($hres)" \
 	|| no "status reports the last-resync result (got '$hres')"
 
+# ============================================================
+# I. offline --mark-dirty re-pushes via the next mount's syncer
+# ============================================================
+# --mark-dirty is the non-blocking cousin of --resync: it only flags the cache
+# dirty (local-only, fast) and returns; the actual push happens incrementally on
+# the next mount's background syncer. Prime a clean cached file, drift its backend
+# copy out-of-band, unmount, mark dirty offline, then remount and confirm the
+# background syncer reconciles the drift back to cache-truth.
+I="$WORK/i"; mkdir -p "$I/backend/sub" "$I/data" "$I/mnt"
+printf 'cache-truth\n' > "$I/backend/sub/inner.txt"
+if ! mount_omdfs "$I/mnt" "$I/omdfs.log" --backend "$I/backend" --datadir "$I/data"; then
+	echo "Bail out! omdfs failed to mount (I); log follows:" >&2; cat "$I/omdfs.log" >&2; exit 98
+fi
+cat "$I/mnt/sub/inner.txt" >/dev/null            # prime the cache (CONTENT_CACHED, clean)
+ls "$I/mnt" "$I/mnt/sub" >/dev/null              # build indexes
+sleep 0.5
+fusermount3 -u "$I/mnt" >/dev/null 2>&1          # clean unmount; clean file => nothing pushed
+wait "$PID" 2>/dev/null
+printf 'BACKEND DRIFTED\n' > "$I/backend/sub/inner.txt"   # out-of-band drift while unmounted
+"$OMDFS" --mark-dirty --backend "$I/backend" --datadir "$I/data" >"$I/mark.log" 2>&1 \
+	&& ok "mark-dirty exits clean" \
+	|| { no "mark-dirty exits clean"; cat "$I/mark.log" >&2; }
+grep -q 'marked dirty' "$I/mark.log" \
+	&& ok "mark-dirty prints a summary" \
+	|| no "mark-dirty prints a summary"
+[ "$(cat "$I/backend/sub/inner.txt")" = "BACKEND DRIFTED" ] \
+	&& ok "mark-dirty does not itself push to the backend" \
+	|| no "mark-dirty does not itself push to the backend"
+if ! mount_omdfs "$I/mnt" "$I/omdfs2.log" --backend "$I/backend" --datadir "$I/data"; then
+	echo "Bail out! omdfs failed to remount (I); log follows:" >&2; cat "$I/omdfs2.log" >&2; exit 98
+fi
+ireconciled() { [ "$(cat "$I/backend/sub/inner.txt" 2>/dev/null)" = "cache-truth" ]; }
+wait_for "next mount's syncer re-pushes the marked-dirty file" ireconciled
+fusermount3 -u "$I/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
+
+# ============================================================
+# J. live mark-dirty trigger re-pushes on a running mount
+# ============================================================
+# Same as H, but via the non-blocking path: a clean cached file's backend copy
+# drifts; the operator creates state/mark-dirty; the syncer flags the tree dirty
+# and the very next flush drains it back to cache-truth — without the operator
+# waiting on the push.
+J="$WORK/j"; mkdir -p "$J/backend" "$J/data" "$J/mnt"
+printf 'cache-truth\n' > "$J/backend/drift.txt"
+if ! mount_omdfs "$J/mnt" "$J/omdfs.log" --backend "$J/backend" --datadir "$J/data"; then
+	echo "Bail out! omdfs failed to mount (J); log follows:" >&2; cat "$J/omdfs.log" >&2; exit 98
+fi
+cat "$J/mnt/drift.txt" >/dev/null                # prime the cache (CONTENT_CACHED, clean)
+ls "$J/mnt" >/dev/null                            # build the index
+sleep 0.5
+printf 'BACKEND DRIFTED\n' > "$J/backend/drift.txt"   # out-of-band change to the backend
+sleep 2                                           # a couple of normal sync cycles
+[ "$(cat "$J/backend/drift.txt")" = "BACKEND DRIFTED" ] \
+	&& ok "normal sync leaves a clean file's backend drift untouched (mark path)" \
+	|| no "normal sync leaves a clean file's backend drift untouched (mark path)"
+touch "$J/data/state/mark-dirty"                  # operator triggers a live mark-dirty
+jreconciled() { [ "$(cat "$J/backend/drift.txt" 2>/dev/null)" = "cache-truth" ]; }
+wait_for "live mark-dirty re-pushes the drifted file via the syncer" jreconciled
+jtrigger_gone() { [ ! -e "$J/data/state/mark-dirty" ]; }
+wait_for "live mark-dirty consumes the trigger file (one-shot)" jtrigger_gone
+jres="$(status_field "$J/data" last-mark-dirty-result)"
+{ [ -n "$jres" ] && [ "$jres" != "-" ]; } \
+	&& ok "status reports the last-mark-dirty result ($jres)" \
+	|| no "status reports the last-mark-dirty result (got '$jres')"
+fusermount3 -u "$J/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
+
 # ---- summary ----
 echo "1..$COUNT"
 if [ "$FAIL" -ne 0 ]; then

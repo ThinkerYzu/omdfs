@@ -524,6 +524,7 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"usage: %s [--config <file>] --backend <dir> --datadir <dir> [--cache-size <bytes>] [fuse-opts] <mountpoint>\n"
 		"       %s --resync [--config <file>] --backend <dir> --datadir <dir>\n"
+		"       %s --mark-dirty [--config <file>] --backend <dir> --datadir <dir>\n"
 		"\n"
 		"  --config <file>     read backend/datadir/cache-size from a key=value file\n"
 		"  --backend <dir>     already-mounted network FS to cache (sshfs/nfs/...)\n"
@@ -532,11 +533,15 @@ static void usage(const char *prog)
 		"  --resync            push the whole cache (content + metadata) to the\n"
 		"                      backend so it matches the cache, then exit; no mount.\n"
 		"                      Run while unmounted. Reports a summary on stderr.\n"
+		"  --mark-dirty        flag the whole cache dirty (local-only) so the next\n"
+		"                      mount's background syncer re-pushes it incrementally,\n"
+		"                      then exit; no mount and no backend push here. Use\n"
+		"                      instead of --resync to avoid waiting for the push.\n"
 		"  <mountpoint>        where omdfs is exposed\n"
 		"\n"
 		"Command-line options override values from --config. While mounted, the\n"
 		"daemon publishes sync progress to <datadir>/state/status.\n",
-		prog, prog);
+		prog, prog, prog);
 }
 
 /* Parse a size like "100", "64K", "512M", "2G" (1024-based). Returns the byte
@@ -674,6 +679,8 @@ static int parse_args(int argc, char **argv, int *out_argc, char **out_argv)
 			g_cfg.cache_budget = sz;
 		} else if (!strcmp(argv[i], "--resync"))
 			g_cfg.resync = 1;
+		else if (!strcmp(argv[i], "--mark-dirty"))
+			g_cfg.mark_dirty = 1;
 		else
 			out_argv[oc++] = argv[i];
 	}
@@ -730,6 +737,13 @@ int main(int argc, char **argv)
 	 * Run while unmounted so the live syncer isn't writing the backend too. */
 	if (g_cfg.resync) {
 		int rc = syncer_resync();
+		free(fuse_argv);
+		return rc;
+	}
+	/* --mark-dirty: flag the whole cache dirty (local-only) so the next mount's
+	 * background syncer re-pushes it incrementally; exit without mounting. */
+	if (g_cfg.mark_dirty) {
+		int rc = syncer_mark_dirty();
 		free(fuse_argv);
 		return rc;
 	}

@@ -460,6 +460,77 @@ int syncer_resync(void)
 	return (rs.failed == 0 && !st.stuck_errno) ? 0 : 1;
 }
 
+/* ---- mark-everything-dirty (non-blocking re-push) ---- */
+
+struct mark_stats {
+	long dirs, files, links;
+	int failed; /* directories that could not be marked (save error) */
+};
+
+/* Flag every cached entry under `fuse_dir` dirty so the background syncer
+ * re-pushes it, without pushing anything here. Local-only metadata writes; the
+ * actual (slow) backend push is left to later sync cycles. */
+static void mark_dirty_tree(const char *fuse_dir, struct mark_stats *ms)
+{
+	struct omdfs_index idx;
+	if (meta_try_load(fuse_dir, &idx) != 0)
+		return; /* not a cached directory */
+
+	if (meta_mark_dir_dirty(fuse_dir, &ms->files, &ms->dirs, &ms->links) != 0)
+		ms->failed++;
+
+	for (size_t i = 0; i < idx.n; i++) {
+		if (idx.entries[i].type != OMDFS_T_DIR)
+			continue;
+		char child[PATH_MAX];
+		join_path(child, fuse_dir, idx.entries[i].name);
+		mark_dirty_tree(child, ms);
+	}
+	meta_free_index(&idx);
+}
+
+int syncer_mark_dirty(void)
+{
+	struct mark_stats ms;
+	memset(&ms, 0, sizeof(ms));
+	mark_dirty_tree("/", &ms);
+	fprintf(stderr,
+		"omdfs: marked dirty %ld files, %ld dirs, %ld symlinks"
+		"%s; the background syncer will push them on the next mount\n",
+		ms.files, ms.dirs, ms.links,
+		ms.failed ? " (some directories could not be marked)" : "");
+	return ms.failed == 0 ? 0 : 1;
+}
+
+/* Result of the most recent live mark-dirty, carried into the status snapshot.
+ * Touched only on the syncer thread (in sync_once), so no locking is needed. */
+static long long s_last_mark_epoch;
+static char s_last_mark[256];
+
+/* An operator requests a live non-blocking re-push by creating
+ * DATADIR/state/mark-dirty (e.g. `touch <datadir>/state/mark-dirty`). The syncer
+ * thread consumes it at the top of a cycle (the unlink both tests for and claims
+ * it, so it fires once), marks the whole tree dirty on this thread, and the same
+ * cycle's flush_pending then begins draining the freshly-seeded backlog. Marking
+ * is local-only, so the operator's `touch` returns immediately and need not wait
+ * for the (slow) backend push to complete. */
+static void maybe_live_mark_dirty(void)
+{
+	char tp[PATH_MAX];
+	snprintf(tp, sizeof(tp), "%s/state/mark-dirty", g_cfg.datadir);
+	if (unlink(tp) != 0)
+		return; /* ENOENT (no request) or unremovable: nothing to do */
+
+	struct mark_stats ms;
+	memset(&ms, 0, sizeof(ms));
+	mark_dirty_tree("/", &ms);
+
+	s_last_mark_epoch = (long long)time(NULL);
+	snprintf(s_last_mark, sizeof(s_last_mark),
+		 "%ld files, %ld dirs, %ld symlinks, %d failed",
+		 ms.files, ms.dirs, ms.links, ms.failed);
+}
+
 /* ---- live (operator-triggered) resync ---- */
 
 /* Result of the most recent live resync, carried into every status snapshot so
@@ -507,6 +578,7 @@ static void sync_once(struct omdfs_status *st)
 	memset(st, 0, sizeof(*st));
 
 	maybe_live_resync(); /* operator-triggered full reconcile, on this thread */
+	maybe_live_mark_dirty(); /* operator-triggered non-blocking re-push */
 
 	phase_structural(st); /* backend dirs/files exist before content flush */
 	flush_pending(st);
@@ -528,6 +600,10 @@ static void sync_once(struct omdfs_status *st)
 	/* Carry the most recent live-resync result so it stays visible in status. */
 	st->last_resync_epoch = s_last_resync_epoch;
 	snprintf(st->last_resync, sizeof(st->last_resync), "%s", s_last_resync);
+
+	/* Likewise the most recent live mark-dirty. */
+	st->last_mark_epoch = s_last_mark_epoch;
+	snprintf(st->last_mark, sizeof(st->last_mark), "%s", s_last_mark);
 }
 
 static void *syncer_loop(void *arg)

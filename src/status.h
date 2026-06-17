@@ -34,6 +34,8 @@ struct omdfs_status {
 	long long last_sync_epoch; /* CLOCK_REALTIME secs of the last clean cycle (0 = never) */
 	long long last_resync_epoch; /* secs of the last operator-triggered resync (0 = never) */
 	char last_resync[256];     /* one-line summary of that resync ("" = never run) */
+	long long last_mark_epoch; /* secs of the last operator-triggered mark-dirty (0 = never) */
+	char last_mark[256];       /* one-line summary of that mark-dirty ("" = never run) */
 };
 
 /* Record the daemon start and write an initial "starting" status file. Call once

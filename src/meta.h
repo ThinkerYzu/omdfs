@@ -62,6 +62,16 @@ struct omdfs_entry *meta_lookup(struct omdfs_index *idx, const char *name);
 int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
 		    uint8_t clear_bits);
 
+/* Mark every child of `fuse_dir` dirty so the background syncer re-pushes it:
+ * OMDFS_F_DIRTY_ATTR on every entry, plus OMDFS_F_DIRTY_CONTENT on regular files
+ * whose content is cached (symlinks carry no flushable state, only existence).
+ * Persists the index once and records the directory in the dirty set. Local-only
+ * — does no backend I/O. Each of files/dirs/links (any may be NULL) is
+ * incremented by the count of that entry type seen. Returns 0, or -errno (the
+ * index is left untouched on a save failure). */
+int meta_mark_dir_dirty(const char *fuse_dir, long *files, long *dirs,
+			long *links);
+
 /* Create an empty index for a freshly-made directory, so it is immediately
  * listable from the local cache without ever consulting the backend (cache as
  * truth). Returns 0 or -errno. */

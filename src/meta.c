@@ -624,6 +624,63 @@ int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
 	return r;
 }
 
+int meta_mark_dir_dirty(const char *fuse_dir, long *files, long *dirs,
+			long *links)
+{
+	pthread_mutex_lock(&meta_mtx);
+	int r;
+	struct omdfs_index *idx = cache_canonical(fuse_dir, &r);
+	if (!idx) {
+		pthread_mutex_unlock(&meta_mtx);
+		return r;
+	}
+	int changed = 0, has_dirty = 0;
+	for (size_t i = 0; i < idx->n; i++) {
+		struct omdfs_entry *e = &idx->entries[i];
+		uint8_t set;
+		switch (e->type) {
+		case OMDFS_T_LINK:
+			/* A symlink is re-created structurally (WAL), not flushed;
+			 * it carries no content/attr to push. */
+			set = 0;
+			if (links)
+				(*links)++;
+			break;
+		case OMDFS_T_DIR:
+			set = OMDFS_F_DIRTY_ATTR;
+			if (dirs)
+				(*dirs)++;
+			break;
+		default: /* regular file */
+			set = OMDFS_F_DIRTY_ATTR;
+			if (e->flags & OMDFS_F_CONTENT_CACHED)
+				set |= OMDFS_F_DIRTY_CONTENT;
+			if (files)
+				(*files)++;
+			break;
+		}
+		uint8_t nf = (uint8_t)(e->flags | set);
+		if (nf != e->flags) {
+			e->flags = nf;
+			changed = 1;
+		}
+		if (nf & OMDFS_F_DIRTY)
+			has_dirty = 1;
+	}
+	r = 0;
+	if (changed) {
+		r = save_index(fuse_dir, idx);
+		if (r != 0)
+			cache_drop(fuse_dir); /* revert to on-disk state */
+	}
+	pthread_mutex_unlock(&meta_mtx);
+	/* Seed the dirty set whenever the directory now holds dirty work, even if
+	 * this call set no new flag (e.g. a re-run), so the syncer revisits it. */
+	if (r == 0 && has_dirty)
+		dirtyset_add(fuse_dir);
+	return r;
+}
+
 int meta_init_dir(const char *fuse_dir, const struct stat *dir_st)
 {
 	struct omdfs_index idx;

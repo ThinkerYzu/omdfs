@@ -40,4 +40,20 @@ void syncer_stop(void);
  * status file's last-resync / last-resync-result lines. */
 int syncer_resync(void);
 
+/* One-shot offline "mark everything dirty" (the --mark-dirty tool): walk the
+ * whole cached tree and flag every entry dirty (content for cached files, attrs
+ * for all) so a later mount's background syncer re-pushes it. Unlike --resync
+ * this does NOT push to the backend — it only writes local metadata and returns,
+ * so it is fast and the slow backend push happens incrementally in the
+ * background on the next mount. Does NOT start the syncer thread. Returns 0, or
+ * 1 if any directory could not be marked (a summary is printed to stderr).
+ *
+ * A *running* mount marks the same way when an operator creates the trigger file
+ * DATADIR/state/mark-dirty (e.g. `touch <datadir>/state/mark-dirty`): the syncer
+ * thread consumes it at the top of a cycle, marks the tree on its own thread,
+ * and the same cycle begins draining the dirty backlog — the operator's `touch`
+ * returns immediately and need not wait for the push to finish. The result is
+ * reported in the status file's last-mark-dirty / last-mark-dirty-result lines. */
+int syncer_mark_dirty(void);
+
 #endif /* OMDFS_SYNCER_H */
