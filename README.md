@@ -131,6 +131,21 @@ interval, runs the reconcile on its own thread (never concurrently with the live
 drain), and reports the outcome in `state/status` (`last-resync`,
 `last-resync-result`).
 
+### Reclaiming cold directory metadata
+
+When a cache budget is set, a cold directory whose cache directory holds nothing
+but its `.omdfs.dir` index (no cached files, no cached subdirectories) and has no
+un-synced children has that index reclaimed and the cache directory removed; the
+listing rebuilds from the backend on next access. It runs automatically (about
+once a minute, only when the sync is fully caught up) and can be forced:
+
+```bash
+touch ~/.omdfs/data/state/cold-evict
+```
+
+`OMDFS_COLD_META=0`/`1` disables/forces it regardless of the budget; the count
+reclaimed since mount is reported in `state/status` as `cold-meta-evicted`.
+
 ## Tests
 
 ```bash
@@ -162,8 +177,8 @@ Early development. Roadmap:
 - [x] Phase 2 — per-directory metadata index for reads
 - [x] Phase 3 — content cache + progressive read
 - [x] Phase 4 — write-back (journal + background syncer) + crash recovery
-- [ ] Phase 5 — eviction (bounded cache)
-- [ ] Phase 6 — hardening (config, status/diagnostics, clean unmount)
+- [x] Phase 5 — eviction (bounded cache), incl. cold-metadata-index eviction
+- [x] Phase 6 — hardening (config, status/diagnostics, clean unmount)
 
 ## License
 
