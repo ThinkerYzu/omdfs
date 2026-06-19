@@ -56,6 +56,16 @@ uint64_t wal_synced_seq(void);
  * would make a refetch fail ENOENT). Cheap: an in-memory seq compare. */
 int wal_has_pending_rename(void);
 
+/* True if every appended structural op has reached the backend (the synced checkpoint
+ * equals the last appended seq) — i.e. the backend namespace currently matches the
+ * cache, with no pending mkdir/create/unlink/rmdir/rename/symlink. Cold-metadata
+ * eviction consults this live (per candidate) so it never reclaims a directory while
+ * any structural op is undrained: a fresh dir whose own mkdir is still pending isn't
+ * yet on the backend (rebuilding its index would ENOENT), and a dir with a pending
+ * child unlink/rename would resurrect that child on rebuild from the stale backend.
+ * Cheap: an in-memory seq compare. */
+int wal_fully_drained(void);
+
 /* Persist a new synced watermark (atomic checkpoint write + fsync). If the log is
  * fully drained (synced == last appended), the WAL file is truncated. */
 int wal_checkpoint(uint64_t synced_seq);

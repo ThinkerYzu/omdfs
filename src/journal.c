@@ -292,6 +292,16 @@ int wal_has_pending_rename(void)
 	return pending;
 }
 
+int wal_fully_drained(void)
+{
+	pthread_mutex_lock(&g_wal);
+	/* g_next_seq - 1 is the last appended seq (0 when nothing was ever appended,
+	 * matching g_synced_seq == 0). Fully drained when the checkpoint has caught up. */
+	int drained = (g_synced_seq == g_next_seq - 1);
+	pthread_mutex_unlock(&g_wal);
+	return drained;
+}
+
 uint64_t wal_synced_seq(void)
 {
 	pthread_mutex_lock(&g_wal);

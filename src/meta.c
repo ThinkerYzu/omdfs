@@ -12,6 +12,7 @@
 #include "meta.h"
 
 #include "dirtyset.h"
+#include "journal.h"
 #include "omdfs.h"
 
 #include <dirent.h>
@@ -1035,6 +1036,25 @@ int meta_evict_cold(const char *fuse_dir)
 	if (dirty) {
 		pthread_mutex_unlock(&meta_mtx);
 		return 0; /* a child still needs flushing: keep the index */
+	}
+
+	/* The premise of reclaiming the index is that the listing rebuilds faithfully
+	 * from the backend on next access — which holds only if the backend namespace
+	 * already matches the cache, i.e. no structural op is still undrained. The
+	 * sync_once gate checks st->pending_structural, but that is measured at the
+	 * start of phase_structural; a structural op appended *after* it (foreground
+	 * mkdir/unlink/rename) is pending-but-uncounted, so the cold sweep can still
+	 * race one. The worst case is a fresh dir whose own mkdir hasn't drained: it
+	 * looks cold (empty cache dir, no dirty children) and would be reclaimed before
+	 * its mkdir reaches the backend, so a create into it would rebuild the index
+	 * from a backend dir that doesn't exist yet → ENOENT. (A pending child
+	 * unlink/rename is the same hazard in reverse: rebuilding from the not-yet-
+	 * updated backend would resurrect the child.) Re-check live, per candidate,
+	 * under meta_mtx — which blocks the mutators from re-keying this subtree — that
+	 * the WAL is fully drained. Cheap: an in-memory seq compare, no backend I/O. */
+	if (!wal_fully_drained()) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 0; /* a structural op is undrained: not safe to reclaim yet */
 	}
 
 	/* The cache directory must hold nothing but the index (+ any stale temp):

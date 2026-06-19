@@ -381,19 +381,34 @@ int content_create(const char *fuse_path, mode_t mode, struct content_handle **o
 
 int content_open_rw(const char *fuse_path, struct content_handle **out)
 {
+	/* Pin across the whole fetch-then-reopen window. content_ensure_cached opens
+	 * an inner handle and then CLOSES it, which unpins the file; without this
+	 * outer pin a clean+cached file could be evicted in the gap before we reopen
+	 * it O_RDWR and re-pin below. That race is silently destructive: open(O_RDWR)
+	 * would still succeed on the just-unlinked inode, our write would land in it
+	 * and be lost when the fd closes, CONTENT_CACHED is now clear, and a later
+	 * read would re-fetch the STALE backend copy. Hold the pin continuously so the
+	 * evictor can never target this file mid-open. */
+	evict_pin(fuse_path);
+
 	int r = content_ensure_cached(fuse_path);
-	if (r != 0)
+	if (r != 0) {
+		evict_unpin(fuse_path);
 		return r;
+	}
 
 	char cp[PATH_MAX];
 	cache_path(cp, fuse_path);
 	int fd = open(cp, O_RDWR);
-	if (fd < 0)
+	if (fd < 0) {
+		evict_unpin(fuse_path);
 		return -errno;
+	}
 
 	struct content_handle *h = calloc(1, sizeof(*h));
 	if (!h) {
 		close(fd);
+		evict_unpin(fuse_path);
 		return -ENOMEM;
 	}
 	h->fd = fd;
@@ -403,7 +418,8 @@ int content_open_rw(const char *fuse_path, struct content_handle **out)
 	struct stat st;
 	if (fstat(fd, &st) == 0)
 		evict_note_present(fuse_path, st.st_size);
-	evict_pin(fuse_path);
+	evict_pin(fuse_path);     /* the handle's own pin (released by content_close) */
+	evict_unpin(fuse_path);   /* drop the outer pin; the handle pin now holds */
 	*out = h;
 	return 0;
 }

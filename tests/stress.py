@@ -126,17 +126,50 @@ def cmd_apply(args):
         Apply to the mount first; if it gets ENOSPC that is the cache-budget
         backpressure firing (the mount overshot its hard limit because dirty data
         is draining slower than this synthetic storm writes) — control, a plain
-        FS, never hits it. Backpressure is checked *before* any bytes are written,
-        so nothing was applied: wait for the syncer to drain and retry. If it
-        persists, skip the op on BOTH roots so they stay in lock-step (logged).
-        Returns True if applied to both, False if skipped."""
-        rt = capture(lambda: fn(os.path.join(target, rel)))
+        FS, never hits it. Wait for the syncer to drain and retry; if it persists,
+        skip the op on BOTH roots so they stay in lock-step (logged). Returns True
+        if applied to both, False if skipped.
+
+        Backpressure is NOT atomic across a single write()/append(): the kernel
+        splits one userspace write into several page-aligned FUSE WRITE requests,
+        and an early request can land (growing the file) just before a later one
+        crosses the hard limit and is refused with ENOSPC — exactly as a real
+        filesystem partially-extends a multi-page write before returning ENOSPC on
+        a full disk. Backpressure only ever refuses GROWTH, so any partial
+        application is a clean tail-extension. Re-running the op verbatim would then
+        corrupt the file (an O_APPEND retry re-appends past the partial bytes,
+        duplicating them). So before each retry — and on the give-up path — revert
+        the target back to its pre-op state, which makes the retry start clean and
+        keeps target/control in lock-step regardless of where ENOSPC struck."""
+        tpath = os.path.join(target, rel)
+        try:
+            pre_size = os.path.getsize(tpath)  # existing file: revert to this size
+            pre_exists = True
+        except OSError:
+            pre_size, pre_exists = 0, False    # op creates the file: revert by removing
+
+        def revert_partial():
+            """Undo any tail-growth a backpressure-interrupted attempt left behind."""
+            if pre_exists:
+                try:
+                    os.truncate(tpath, pre_size)
+                except OSError:
+                    pass
+            else:
+                try:
+                    os.unlink(tpath)
+                except OSError:
+                    pass
+
+        rt = capture(lambda: fn(tpath))
         tries = 0
         while not rt[0] and rt[1] == errno.ENOSPC and tries < 50:
             time.sleep(0.1)
             tries += 1
-            rt = capture(lambda: fn(os.path.join(target, rel)))
+            revert_partial()
+            rt = capture(lambda: fn(tpath))
         if not rt[0] and rt[1] == errno.ENOSPC:
+            revert_partial()  # leave target == control (op applied to neither)
             sys.stderr.write("note: op #%d %s %r skipped: persistent cache "
                              "backpressure (ENOSPC)\n" % (i, op, rel))
             return False
