@@ -17,7 +17,7 @@ SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 BIN := omdfs
 
-.PHONY: all clean test
+.PHONY: all clean test stress
 all: $(BIN)
 
 test: $(BIN)
@@ -25,6 +25,11 @@ test: $(BIN)
 	@tests/crash-recovery.sh ./$(BIN)
 	@tests/eviction.sh ./$(BIN)
 	@tests/hardening.sh ./$(BIN)
+
+# Differential consistency stress test (not part of `make test`; can be long).
+# Knobs: STRESS_SEED STRESS_OPS STRESS_ROUNDS STRESS_CACHE STRESS_MAXSZ.
+stress: $(BIN)
+	@tests/stress.sh ./$(BIN)
 
 $(BIN): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
