@@ -6,3 +6,7 @@
 # Editor / OS
 *.swp
 .DS_Store
+
+# FUSE stale-mount artifacts (a file deleted while open under the repo dir)
+.fuse_hidden*
+.omdfs.dir
