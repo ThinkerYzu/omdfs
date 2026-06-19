@@ -239,7 +239,7 @@ static void pool_start(void)
 		if (pthread_create(&pool_threads[n], NULL, pool_worker, NULL) != 0)
 			break;
 	pool_nthreads = n;
-	pool_started = (n > 0); /* n==0: pool_submit falls back to inline */
+	pool_started = (n > 0); /* n==0: pool_enqueue falls back to inline */
 	pthread_mutex_unlock(&pool_mtx);
 }
 
@@ -521,32 +521,51 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 	join_path(fpath, fuse_dir, e->name);
 	backend_path(bp, fpath);
 
-	int ok = dry ? 0 : 1; /* dry: treat as "not pushed" -> count + re-arm */
 	if (dry) {
-		/* no backend I/O, no flag clearing */
-	} else if (e->flags & OMDFS_F_DIRTY_CONTENT) {
+		/* Paused (flush-off) or saturated: no backend I/O, no flag clearing.
+		 * Just count the backlog and re-arm the dir so it is revisited. */
+		pthread_mutex_lock(&s_stat_mtx);
+		st->dirty_files++;
+		if (e->flags & OMDFS_F_DIRTY_CONTENT)
+			st->dirty_bytes += (long long)e->st.st_size;
+		pthread_mutex_unlock(&s_stat_mtx);
+		dirtyset_add(fuse_dir);
+		return;
+	}
+
+	/* Claim the entry's current dirty state under the lock (clears its flags) so
+	 * a mutation racing this push isn't lost: it re-dirties the entry and is
+	 * re-flushed next cycle instead of being silently dropped when we'd clear
+	 * the flag post-push. We push the freshly-claimed snapshot. */
+	struct omdfs_entry cur;
+	uint8_t claimed;
+	int c = meta_flush_claim(fuse_dir, e->name, &cur, &claimed);
+	if (c != 0)
+		return; /* gone, no longer dirty, or save failed (already re-armed) */
+
+	int ok = 1;
+	if (claimed & OMDFS_F_DIRTY_CONTENT) {
 		char cp[PATH_MAX];
 		cache_path(cp, fpath);
 		if (copy_file(cp, bp) == 0)
-			apply_attrs(bp, e);
+			apply_attrs(bp, &cur);
 		else
 			ok = 0; /* backend path not ready yet; retry */
-	} else if (e->flags & OMDFS_F_DIRTY_ATTR) {
-		apply_attrs(bp, e);
+	} else if (claimed & OMDFS_F_DIRTY_ATTR) {
+		apply_attrs(bp, &cur);
 	}
-	if (ok) {
-		meta_mark_flags(fuse_dir, e->name, 0,
-				OMDFS_F_DIRTY_CONTENT | OMDFS_F_DIRTY_ATTR);
-		return;
+	if (!ok) {
+		/* Restore the claimed bits so the next cycle retries; count backlog. */
+		meta_mark_flags(fuse_dir, e->name, claimed, 0);
+		pthread_mutex_lock(&s_stat_mtx);
+		st->dirty_files++;
+		if (claimed & OMDFS_F_DIRTY_CONTENT)
+			st->dirty_bytes += (long long)cur.st.st_size;
+		pthread_mutex_unlock(&s_stat_mtx);
+		dirtyset_add(fuse_dir);
 	}
-	/* Still pending: count it in the backlog and re-record the dir so the fast
-	 * path retries it next cycle. */
-	pthread_mutex_lock(&s_stat_mtx);
-	st->dirty_files++;
-	if (e->flags & OMDFS_F_DIRTY_CONTENT)
-		st->dirty_bytes += (long long)e->st.st_size;
-	pthread_mutex_unlock(&s_stat_mtx);
-	dirtyset_add(fuse_dir);
+	free(cur.name);
+	free(cur.link);
 }
 
 /* A single dirty entry handed to the pool. Owns its strings; freed by the worker.
@@ -1168,6 +1187,11 @@ static void sync_once(struct omdfs_status *st, int may_yield)
 	}
 	st->last_sync_epoch = s_last_clean;
 	st->cold_evicted = s_cold_evicted_total;
+
+	/* Async index write-back backlog (the local .omdfs.dir persists, off the
+	 * metadata lock — distinct from the backend dirty flush above). */
+	meta_writeback_status(&st->index_pending, &st->index_errno, st->index_path,
+			      sizeof(st->index_path));
 
 	/* Carry the most recent live-resync result so it stays visible in status. */
 	st->last_resync_epoch = s_last_resync_epoch;

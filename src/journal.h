@@ -47,6 +47,15 @@ int wal_load_pending(uint64_t after_seq, struct wal_record **out, size_t *n);
 /* The highest seq known to be applied to the backend (from the checkpoint). */
 uint64_t wal_synced_seq(void);
 
+/* True if a structural RENAME has been appended but not yet applied to the backend
+ * (the last appended rename's seq is beyond the synced checkpoint). A rename is the
+ * only structural op that relocates an existing cached file, so while one is pending
+ * the backend namespace may not match the cache and a clean file's content may still
+ * sit at its OLD backend path. Eviction consults this so it never drops a clean
+ * file's cache copy whose backend copy isn't yet at the file's current path (which
+ * would make a refetch fail ENOENT). Cheap: an in-memory seq compare. */
+int wal_has_pending_rename(void);
+
 /* Persist a new synced watermark (atomic checkpoint write + fsync). If the log is
  * fully drained (synced == last appended), the WAL file is truncated. */
 int wal_checkpoint(uint64_t synced_seq);

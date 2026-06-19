@@ -18,9 +18,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define OMDFS_INDEX_MAGIC 0x4f444952u /* "ODIR" */
@@ -191,18 +193,22 @@ struct omdfs_entry *meta_lookup(struct omdfs_index *idx, const char *name)
 
 /* ---- persistence ---- */
 
-static int save_index(const char *fuse_dir, const struct omdfs_index *idx)
+/* Serialize `idx` into a freshly malloc'd flat buffer in the on-disk format
+ * (header + entries). On success *out owns the buffer (caller frees) and *len is
+ * its length; returns 0, or -ENOMEM. This is the part that runs under meta_mtx in
+ * the async write-back path — a bounded memcpy, no fsync. */
+static int serialize_index(const struct omdfs_index *idx, void **out, size_t *len)
 {
-	char cdir[PATH_MAX];
-	cache_path(cdir, fuse_dir);
-	if (mkdirs(cdir) != 0)
-		return -errno;
+	size_t total = sizeof(struct index_header);
+	for (size_t i = 0; i < idx->n; i++) {
+		const struct omdfs_entry *e = &idx->entries[i];
+		total += sizeof(struct entry_header) + strlen(e->name) +
+			 (e->link ? strlen(e->link) : 0);
+	}
 
-	char tmpl[PATH_MAX];
-	snprintf(tmpl, sizeof(tmpl), "%s/%s.XXXXXX", cdir, OMDFS_INDEX_NAME);
-	int fd = mkstemp(tmpl);
-	if (fd < 0)
-		return -errno;
+	char *buf = malloc(total);
+	if (!buf)
+		return -ENOMEM;
 
 	struct index_header h = {
 		.magic = OMDFS_INDEX_MAGIC,
@@ -210,8 +216,9 @@ static int save_index(const char *fuse_dir, const struct omdfs_index *idx)
 		.count = (uint32_t)idx->n,
 		.dir_st = idx->dir_st,
 	};
-	if (write_all(fd, &h, sizeof(h)) != 0)
-		goto fail;
+	size_t o = 0;
+	memcpy(buf + o, &h, sizeof(h));
+	o += sizeof(h);
 
 	for (size_t i = 0; i < idx->n; i++) {
 		const struct omdfs_entry *e = &idx->entries[i];
@@ -224,14 +231,42 @@ static int save_index(const char *fuse_dir, const struct omdfs_index *idx)
 			.link_len = (uint16_t)llen,
 			.st = e->st,
 		};
-		if (write_all(fd, &eh, sizeof(eh)) != 0 ||
-		    write_all(fd, e->name, nlen) != 0 ||
-		    (llen && write_all(fd, e->link, llen) != 0))
-			goto fail;
+		memcpy(buf + o, &eh, sizeof(eh));
+		o += sizeof(eh);
+		memcpy(buf + o, e->name, nlen);
+		o += nlen;
+		if (llen) {
+			memcpy(buf + o, e->link, llen);
+			o += llen;
+		}
 	}
 
-	if (fsync(fd) != 0)
-		goto fail;
+	*out = buf;
+	*len = total;
+	return 0;
+}
+
+/* Atomically replace `fuse_dir`'s on-disk index with `buf` (write a temp,
+ * fsync, rename). The slow part (fsync + rename) — runs OFF meta_mtx in the async
+ * path. Returns 0 or -errno. */
+static int write_index_buf(const char *fuse_dir, const void *buf, size_t len)
+{
+	char cdir[PATH_MAX];
+	cache_path(cdir, fuse_dir);
+	if (mkdirs(cdir) != 0)
+		return -errno;
+
+	char tmpl[PATH_MAX];
+	snprintf(tmpl, sizeof(tmpl), "%s/%s.XXXXXX", cdir, OMDFS_INDEX_NAME);
+	int fd = mkstemp(tmpl);
+	if (fd < 0)
+		return -errno;
+
+	if (write_all(fd, buf, len) != 0 || fsync(fd) != 0) {
+		close(fd);
+		unlink(tmpl);
+		return -EIO;
+	}
 	close(fd);
 
 	char ipath[PATH_MAX];
@@ -242,11 +277,22 @@ static int save_index(const char *fuse_dir, const struct omdfs_index *idx)
 		return -e;
 	}
 	return 0;
+}
 
-fail:
-	close(fd);
-	unlink(tmpl);
-	return -EIO;
+/* Synchronous persist: serialize + write. Used by build_index (the load-miss
+ * path) and as the fallback for the offline tools, which run before the async
+ * index-writer thread is started. The mounted hot path goes through
+ * meta_schedule_save instead. */
+static int save_index(const char *fuse_dir, const struct omdfs_index *idx)
+{
+	void *buf;
+	size_t len;
+	int r = serialize_index(idx, &buf, &len);
+	if (r != 0)
+		return r;
+	r = write_index_buf(fuse_dir, buf, len);
+	free(buf);
+	return r;
 }
 
 static int load_index(const char *fuse_dir, struct omdfs_index *idx)
@@ -406,11 +452,158 @@ struct cnode {
 	struct omdfs_index idx; /* canonical parsed index (owns its names/links) */
 	struct cnode *hnext;    /* hash-bucket chain */
 	struct cnode *lru_prev, *lru_next; /* LRU list: head = MRU, tail = LRU */
+	/* Asynchronous index write-back state (all under meta_mtx). save_dirty: the
+	 * canonical changed since the last on-disk snapshot. save_inflight: queued on
+	 * / being written by the index-writer thread. Their disjunction (cnode_pinned)
+	 * pins the node against eviction and makes meta_forget wait — the on-disk index
+	 * is stale until the write lands, so the node must not be dropped or
+	 * reloaded-from-disk meanwhile. wq_next chains the writer queue (a node is
+	 * enqueued at most once while save_inflight holds). */
+	int save_dirty;
+	int save_inflight;
+	struct cnode *wq_next;
 };
+
+/* Recover the owning cnode from a canonical index pointer: cache_canonical hands
+ * out &cnode.idx, and the mutators pass that straight to meta_schedule_save. */
+#define cnode_of(idxp) \
+	((struct cnode *)((char *)(idxp) - offsetof(struct cnode, idx)))
 
 static struct cnode *cache_buckets[META_CACHE_BUCKETS];
 static struct cnode *lru_head, *lru_tail;
 static size_t cache_count;
+
+/* ---- asynchronous index write-back ----
+ *
+ * save_index does mkstemp + write + fsync + rename; doing it under meta_mtx made
+ * every mutating op serialize the whole critical section behind a local-disk
+ * fsync, stalling the foreground readers that share the lock. Instead a mutator
+ * marks its node dirty and hands it to a single dedicated writer thread: the
+ * snapshot (serialize to a flat buffer) happens under the lock, but the
+ * fsync/rename runs off it. Repeat mutations on a dir that is mid-write coalesce
+ * (save_dirty is re-set; the writer loops). See DESIGN.md "Asynchronous coalesced
+ * index write-back". */
+static pthread_cond_t wq_cond = PTHREAD_COND_INITIALIZER;  /* new work / stop */
+static pthread_cond_t pin_cond = PTHREAD_COND_INITIALIZER; /* a pin cleared */
+static struct cnode *wq_head, *wq_tail;
+static pthread_t writer_thread;
+static int writer_running; /* async on (mounted); else mutators save inline */
+static int writer_stop;    /* shutdown: drain the queue, then exit */
+static int wb_last_errno;  /* last write-back failure for status, 0 if none */
+static char wb_last_path[PATH_MAX];
+
+/* Pinned = a write is pending: never evict, and meta_forget must wait. */
+static int cnode_pinned(const struct cnode *n)
+{
+	return n->save_dirty || n->save_inflight;
+}
+
+/* meta_mtx held. Append a node to the writer queue (enqueued at most once). */
+static void wq_push(struct cnode *n)
+{
+	n->wq_next = NULL;
+	if (wq_tail)
+		wq_tail->wq_next = n;
+	else
+		wq_head = n;
+	wq_tail = n;
+}
+
+/* meta_mtx held. Pop the queue head, or NULL if empty. */
+static struct cnode *wq_pop(void)
+{
+	struct cnode *n = wq_head;
+	if (n) {
+		wq_head = n->wq_next;
+		if (!wq_head)
+			wq_tail = NULL;
+		n->wq_next = NULL;
+	}
+	return n;
+}
+
+/* Persist cnode `n`'s canonical index. With the writer running (mounted) this
+ * only schedules: mark dirty, enqueue if not already in-flight, return 0 — the
+ * fsync happens off meta_mtx on the writer thread. Without the writer (the
+ * offline --resync/--mark-dirty tools) it writes synchronously and returns the
+ * result, preserving the callers' revert-on-error path. meta_mtx held. */
+static int meta_schedule_save(struct cnode *n)
+{
+	if (!writer_running)
+		return save_index(n->dir, &n->idx);
+	n->save_dirty = 1;
+	if (!n->save_inflight) {
+		n->save_inflight = 1;
+		wq_push(n);
+		pthread_cond_signal(&wq_cond);
+	}
+	return 0;
+}
+
+static void *index_writer_main(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&meta_mtx);
+	for (;;) {
+		while (!wq_head && !writer_stop)
+			pthread_cond_wait(&wq_cond, &meta_mtx);
+		struct cnode *n = wq_pop();
+		if (!n) {
+			if (writer_stop)
+				break; /* queue drained and stop requested */
+			continue;
+		}
+
+		/* Snapshot the current canonical under the lock (memcpy, no fsync). */
+		n->save_dirty = 0;
+		void *buf = NULL;
+		size_t len = 0;
+		int r = serialize_index(&n->idx, &buf, &len);
+		char dir[PATH_MAX];
+		snprintf(dir, sizeof(dir), "%s", n->dir);
+		pthread_mutex_unlock(&meta_mtx);
+
+		/* The fsync + rename — off the lock, so readers run meanwhile. */
+		if (r == 0) {
+			r = write_index_buf(dir, buf, len);
+			free(buf);
+		}
+
+		pthread_mutex_lock(&meta_mtx);
+		if (r == 0) {
+			wb_last_errno = 0;
+		} else {
+			/* The mutation already returned success to the app, so we
+			 * cannot revert — keep the node dirty and retry. On a clean
+			 * unmount give up after this attempt so the drain terminates
+			 * even on a broken disk (the on-disk index just stays stale). */
+			wb_last_errno = -r;
+			snprintf(wb_last_path, sizeof(wb_last_path), "%s", dir);
+			if (!writer_stop)
+				n->save_dirty = 1;
+		}
+
+		if (n->save_dirty) {
+			wq_push(n); /* coalesced newer state, or a retry */
+			if (r != 0) {
+				/* Throttle a failing retry so it doesn't hot-spin. */
+				struct timespec ts;
+				clock_gettime(CLOCK_REALTIME, &ts);
+				ts.tv_nsec += 200L * 1000 * 1000;
+				if (ts.tv_nsec >= 1000000000L) {
+					ts.tv_sec++;
+					ts.tv_nsec -= 1000000000L;
+				}
+				pthread_cond_timedwait(&wq_cond, &meta_mtx, &ts);
+			}
+		} else {
+			n->save_inflight = 0;
+			pthread_cond_broadcast(&pin_cond); /* wake meta_forget */
+		}
+	}
+	pthread_mutex_unlock(&meta_mtx);
+	return NULL;
+}
 
 static size_t cache_hash(const char *s)
 {
@@ -473,10 +666,19 @@ static void cache_remove_node(struct cnode *n)
 	free(n);
 }
 
-/* Drop the canonical for `dir` if present (next access reparses from disk). */
+/* Drop the canonical for `dir` if present (next access reparses from disk). If a
+ * write-back is in flight for it, wait for that to finish first: the on-disk index
+ * is stale until then, and the writer thread still holds the node — freeing it
+ * would resurrect a stale index (its rename landing after ours) and use-after-free
+ * the writer. (With the writer not running — the offline tools — no node is ever
+ * pinned, so this never blocks.) */
 static void cache_drop(const char *dir)
 {
 	struct cnode *n = cache_find(dir);
+	while (n && cnode_pinned(n)) {
+		pthread_cond_wait(&pin_cond, &meta_mtx);
+		n = cache_find(dir);
+	}
 	if (n)
 		cache_remove_node(n);
 }
@@ -495,13 +697,23 @@ static struct cnode *cache_insert(const char *dir, struct omdfs_index *idx)
 		return NULL;
 	}
 	n->idx = *idx; /* move: caller relinquishes ownership of idx->entries */
+	n->save_dirty = 0;
+	n->save_inflight = 0;
+	n->wq_next = NULL;
 	size_t b = cache_hash(dir);
 	n->hnext = cache_buckets[b];
 	cache_buckets[b] = n;
 	lru_push_front(n);
 	cache_count++;
-	while (cache_count > META_CACHE_MAX && lru_tail && lru_tail != n)
-		cache_remove_node(lru_tail);
+	/* Evict unpinned victims from the LRU tail; skip nodes with a pending index
+	 * write (dropping one would lose the not-yet-persisted change), so the cache
+	 * may transiently exceed budget by the in-flight count — bounded and fine. */
+	for (struct cnode *v = lru_tail; v && cache_count > META_CACHE_MAX;) {
+		struct cnode *prev = v->lru_prev;
+		if (v != n && !cnode_pinned(v))
+			cache_remove_node(v);
+		v = prev;
+	}
 	return n;
 }
 
@@ -755,16 +967,29 @@ void meta_forget_tree(const char *prefix)
 {
 	size_t plen = strlen(prefix);
 	pthread_mutex_lock(&meta_mtx);
-	for (size_t b = 0; b < META_CACHE_BUCKETS; b++) {
-		struct cnode *n = cache_buckets[b];
-		while (n) {
-			struct cnode *next = n->hnext;
-			if (!strcmp(n->dir, prefix) ||
-			    (!strncmp(n->dir, prefix, plen) &&
-			     n->dir[plen] == '/'))
-				cache_remove_node(n);
-			n = next;
+	/* Remove every unpinned match in a pass; if any match still has a write-back
+	 * in flight, wait for a pin to clear and rescan (its write must land before we
+	 * drop it — see cache_drop). The writer makes progress, so this terminates. */
+	for (;;) {
+		int pinned_match = 0;
+		for (size_t b = 0; b < META_CACHE_BUCKETS; b++) {
+			struct cnode *n = cache_buckets[b];
+			while (n) {
+				struct cnode *next = n->hnext;
+				if (!strcmp(n->dir, prefix) ||
+				    (!strncmp(n->dir, prefix, plen) &&
+				     n->dir[plen] == '/')) {
+					if (cnode_pinned(n))
+						pinned_match = 1;
+					else
+						cache_remove_node(n);
+				}
+				n = next;
+			}
 		}
+		if (!pinned_match)
+			break;
+		pthread_cond_wait(&pin_cond, &meta_mtx);
 	}
 	pthread_mutex_unlock(&meta_mtx);
 }
@@ -783,6 +1008,12 @@ int meta_evict_cold(const char *fuse_dir)
 	struct omdfs_index local;
 	int loaded = 0;
 	struct cnode *cn = cache_find(fuse_dir);
+	if (cn && cnode_pinned(cn)) {
+		/* A write-back is pending: it may be clearing a just-flushed dirty
+		 * flag. Skip this round; a later (clean) sweep reclaims it. */
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
 	const struct omdfs_index *idx;
 	if (cn) {
 		idx = &cn->idx;
@@ -871,7 +1102,7 @@ int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
 	r = 0;
 	if (nf != e->flags) {
 		e->flags = nf;
-		r = save_index(fuse_dir, idx);
+		r = meta_schedule_save(cnode_of(idx));
 		if (r != 0)
 			cache_drop(fuse_dir); /* revert to on-disk state */
 	}
@@ -879,6 +1110,57 @@ int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
 	if (r == 0 && (set_bits & OMDFS_F_DIRTY))
 		dirtyset_add(fuse_dir);
 	return r;
+}
+
+int meta_flush_claim(const char *fuse_dir, const char *name,
+		     struct omdfs_entry *out, uint8_t *cleared)
+{
+	pthread_mutex_lock(&meta_mtx);
+	int r;
+	struct omdfs_index *idx = cache_canonical(fuse_dir, &r);
+	if (!idx) {
+		pthread_mutex_unlock(&meta_mtx);
+		return -ENOENT;
+	}
+	struct omdfs_entry *e = meta_lookup(idx, name);
+	if (!e) {
+		pthread_mutex_unlock(&meta_mtx);
+		return -ENOENT;
+	}
+	uint8_t d = e->flags & OMDFS_F_DIRTY;
+	if (!d) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 1; /* no longer dirty: another path handled it */
+	}
+	/* Deep-copy the entry's *current* state for the caller to push, then clear
+	 * the dirty bits atomically. A mutation that re-dirties this entry after we
+	 * unlock re-sets the bits (so it is re-flushed next cycle) instead of being
+	 * lost when the push completes and the flag is cleared. */
+	*out = *e;
+	out->name = strdup(e->name);
+	out->link = e->link ? strdup(e->link) : NULL;
+	if (!out->name || (e->link && !out->link)) {
+		free(out->name);
+		free(out->link);
+		pthread_mutex_unlock(&meta_mtx);
+		return -ENOMEM;
+	}
+	e->flags = (uint8_t)(e->flags & ~OMDFS_F_DIRTY);
+	r = meta_schedule_save(cnode_of(idx));
+	if (r != 0) {
+		/* Couldn't persist the cleared flags; revert so the entry stays dirty
+		 * and retry next cycle. */
+		e->flags |= d;
+		free(out->name);
+		free(out->link);
+		cache_drop(fuse_dir);
+		pthread_mutex_unlock(&meta_mtx);
+		dirtyset_add(fuse_dir);
+		return -EIO;
+	}
+	*cleared = d;
+	pthread_mutex_unlock(&meta_mtx);
+	return 0;
 }
 
 int meta_mark_dir_dirty(const char *fuse_dir, long *files, long *dirs,
@@ -926,7 +1208,7 @@ int meta_mark_dir_dirty(const char *fuse_dir, long *files, long *dirs,
 	}
 	r = 0;
 	if (changed) {
-		r = save_index(fuse_dir, idx);
+		r = meta_schedule_save(cnode_of(idx));
 		if (r != 0)
 			cache_drop(fuse_dir); /* revert to on-disk state */
 	}
@@ -940,20 +1222,23 @@ int meta_mark_dir_dirty(const char *fuse_dir, long *files, long *dirs,
 
 int meta_init_dir(const char *fuse_dir, const struct stat *dir_st)
 {
-	struct omdfs_index idx;
-	memset(&idx, 0, sizeof(idx));
-	idx.dir_st = *dir_st;
 	pthread_mutex_lock(&meta_mtx);
-	int r = save_index(fuse_dir, &idx);
-	if (r == 0) {
-		/* Publish the fresh empty index as the canonical so the new dir
-		 * is immediately served from cache (replacing any stale entry
-		 * left from a prior same-path dir). */
-		cache_drop(fuse_dir);
-		struct omdfs_index fresh;
-		memset(&fresh, 0, sizeof(fresh));
-		fresh.dir_st = *dir_st;
-		cache_insert(fuse_dir, &fresh); /* NULL on OOM: fine, loads later */
+	/* Publish the fresh empty index as the canonical so the new dir is
+	 * immediately served from cache (replacing any stale entry left from a prior
+	 * same-path dir), then schedule its persist. */
+	cache_drop(fuse_dir);
+	struct omdfs_index fresh;
+	memset(&fresh, 0, sizeof(fresh));
+	fresh.dir_st = *dir_st;
+	struct cnode *n = cache_insert(fuse_dir, &fresh);
+	int r;
+	if (n) {
+		r = meta_schedule_save(n);
+	} else {
+		/* OOM: no cnode to write back from — persist synchronously so the
+		 * new dir is durable (served from disk on next access). */
+		r = save_index(fuse_dir, &fresh);
+		meta_free_index(&fresh);
 	}
 	pthread_mutex_unlock(&meta_mtx);
 	return r;
@@ -981,7 +1266,7 @@ int meta_add_entry(const char *fuse_dir, const struct omdfs_entry *e)
 		pthread_mutex_unlock(&meta_mtx);
 		return -ENOMEM;
 	}
-	r = save_index(fuse_dir, idx);
+	r = meta_schedule_save(cnode_of(idx));
 	if (r != 0)
 		cache_drop(fuse_dir);
 	pthread_mutex_unlock(&meta_mtx);
@@ -1014,7 +1299,7 @@ int meta_remove_entry(const char *fuse_dir, const char *name)
 		return -ENOENT;
 	}
 	drop_at(idx, (size_t)(e - idx->entries));
-	r = save_index(fuse_dir, idx);
+	r = meta_schedule_save(cnode_of(idx));
 	if (r != 0)
 		cache_drop(fuse_dir);
 	pthread_mutex_unlock(&meta_mtx);
@@ -1051,7 +1336,7 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		e->name = nn;
 		idx_hash_drop(idx); /* name changed in place: invalidate the hash */
 		dst_dirty = (e->flags & OMDFS_F_DIRTY) != 0;
-		r = save_index(old_dir, idx);
+		r = meta_schedule_save(cnode_of(idx));
 		if (r != 0)
 			cache_drop(old_dir);
 		goto out;
@@ -1077,7 +1362,7 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		goto out;
 	}
 	drop_at(oidx, (size_t)(e - oidx->entries));
-	r = save_index(old_dir, oidx);
+	r = meta_schedule_save(cnode_of(oidx));
 	if (r != 0) {
 		cache_drop(old_dir);
 		free(moved.name);
@@ -1085,8 +1370,8 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		goto out;
 	}
 
-	/* NB: cache_canonical(new_dir) may evict the old_dir node (already saved
-	 * and no longer used here) if RAM is tight — harmless. */
+	/* NB: scheduling old_dir's save pins its node, so the cache_canonical(new_dir)
+	 * below won't evict it out from under the pending write-back. */
 	struct omdfs_index *nidx = cache_canonical(new_dir, &r);
 	if (!nidx) {
 		free(moved.name);
@@ -1102,7 +1387,7 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		r = -ENOMEM;
 		goto out;
 	}
-	r = save_index(new_dir, nidx);
+	r = meta_schedule_save(cnode_of(nidx));
 	if (r != 0)
 		cache_drop(new_dir);
 
@@ -1144,11 +1429,98 @@ int meta_set(const char *fuse_dir, const char *name, const struct stat *src,
 		e->st.st_mtim = src->st_mtim;
 	}
 	e->flags |= dirty;
-	r = save_index(fuse_dir, idx);
-	if (r != 0)
+	int is_dir = (e->type == OMDFS_T_DIR);
+	struct stat newst = e->st;
+	r = meta_schedule_save(cnode_of(idx));
+	if (r != 0) {
 		cache_drop(fuse_dir);
+		pthread_mutex_unlock(&meta_mtx);
+		return r;
+	}
+	/* A directory's mode/owner/times live in two places: this entry in the
+	 * parent index (read by getattr and the dirty flush) and the directory's
+	 * OWN index dir_st (read by readdir's "." and by --resync). Keep them in
+	 * sync so the change isn't reverted by a stale dir_st on a later resync. */
+	if (is_dir) {
+		char child[PATH_MAX];
+		if (fuse_dir[0] == '/' && fuse_dir[1] == '\0')
+			snprintf(child, sizeof(child), "/%s", name);
+		else
+			snprintf(child, sizeof(child), "%s/%s", fuse_dir, name);
+		int cr;
+		struct omdfs_index *cidx = cache_canonical(child, &cr);
+		if (cidx) {
+			if (fields & META_MODE)
+				cidx->dir_st.st_mode =
+					(cidx->dir_st.st_mode & S_IFMT) |
+					(newst.st_mode & 07777);
+			if (fields & META_UID)
+				cidx->dir_st.st_uid = newst.st_uid;
+			if (fields & META_GID)
+				cidx->dir_st.st_gid = newst.st_gid;
+			if (fields & META_TIMES) {
+				cidx->dir_st.st_atim = newst.st_atim;
+				cidx->dir_st.st_mtim = newst.st_mtim;
+			}
+			meta_schedule_save(cnode_of(cidx));
+		}
+	}
 	pthread_mutex_unlock(&meta_mtx);
 	if (r == 0 && (dirty & OMDFS_F_DIRTY))
 		dirtyset_add(fuse_dir);
 	return r;
+}
+
+/* Start the async index-writer thread. Call once at mount, before any FUSE op or
+ * the syncer (which clears dirty flags via meta_mark_flags). Until this runs, the
+ * mutators persist synchronously (the offline tools' path). Returns 0 or -errno. */
+int meta_init(void)
+{
+	writer_stop = 0;
+	if (pthread_create(&writer_thread, NULL, index_writer_main, NULL) != 0)
+		return -errno;
+	pthread_mutex_lock(&meta_mtx);
+	writer_running = 1;
+	pthread_mutex_unlock(&meta_mtx);
+	return 0;
+}
+
+/* Drain every pending index write and stop the writer thread. Call at unmount
+ * AFTER syncer_stop, so dirty-flag clears from the final backend drain also
+ * persist. Idempotent; a no-op if meta_init never ran. */
+void meta_shutdown(void)
+{
+	pthread_mutex_lock(&meta_mtx);
+	if (!writer_running) {
+		pthread_mutex_unlock(&meta_mtx);
+		return;
+	}
+	writer_stop = 1;
+	pthread_cond_broadcast(&wq_cond);
+	pthread_mutex_unlock(&meta_mtx);
+	pthread_join(writer_thread, NULL);
+	pthread_mutex_lock(&meta_mtx);
+	writer_running = 0;
+	pthread_mutex_unlock(&meta_mtx);
+}
+
+/* Report index write-back state for the status file: *pending = directories
+ * queued for write (excludes the one currently being written), *last_errno = the
+ * most recent write failure (0 if the last write succeeded), *path = that
+ * failure's directory. Any out param may be NULL. */
+void meta_writeback_status(int *pending, int *last_errno, char *path,
+			   size_t pathsz)
+{
+	pthread_mutex_lock(&meta_mtx);
+	if (pending) {
+		int c = 0;
+		for (struct cnode *n = wq_head; n; n = n->wq_next)
+			c++;
+		*pending = c;
+	}
+	if (last_errno)
+		*last_errno = wb_last_errno;
+	if (path && pathsz)
+		snprintf(path, pathsz, "%s", wb_last_path);
+	pthread_mutex_unlock(&meta_mtx);
 }

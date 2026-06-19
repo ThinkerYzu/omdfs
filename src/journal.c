@@ -23,6 +23,10 @@
 static pthread_mutex_t g_wal = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_next_seq = 1;	  /* next seq to assign */
 static uint64_t g_synced_seq = 0; /* from the checkpoint */
+static uint64_t g_last_rename_seq = 0; /* seq of the most recent appended RENAME;
+					* > g_synced_seq means a rename has not yet
+					* reached the backend (see
+					* wal_has_pending_rename / eviction). */
 
 /* ---- crc32 (IEEE, reflected) ---- */
 
@@ -185,6 +189,15 @@ struct collect {
 	size_t n, cap;
 };
 
+/* Recovery helper: track the highest RENAME seq seen so wal_init can restore
+ * g_last_rename_seq across a remount (a crash may leave un-synced renames). */
+static void max_rename_cb(const struct wal_record *rec, void *arg)
+{
+	uint64_t *m = arg;
+	if (rec->op == WAL_RENAME && rec->seq > *m)
+		*m = rec->seq;
+}
+
 static void collect_cb(const struct wal_record *rec, void *arg)
 {
 	struct collect *c = arg;
@@ -231,10 +244,11 @@ int wal_init(void)
 		close(fd);
 	}
 
-	uint64_t max = 0;
-	int r = wal_scan(&max, NULL, NULL);
+	uint64_t max = 0, last_rename = 0;
+	int r = wal_scan(&max, max_rename_cb, &last_rename);
 	if (r != 0)
 		return r;
+	g_last_rename_seq = last_rename;
 	uint64_t base = g_synced_seq > max ? g_synced_seq : max;
 	g_next_seq = base + 1;
 	return 0;
@@ -264,8 +278,18 @@ uint64_t wal_append(uint8_t op, const char *path, const char *path2)
 	close(fd);
 	free(rec);
 	g_next_seq = seq + 1;
+	if (op == WAL_RENAME)
+		g_last_rename_seq = seq;
 	pthread_mutex_unlock(&g_wal);
 	return seq;
+}
+
+int wal_has_pending_rename(void)
+{
+	pthread_mutex_lock(&g_wal);
+	int pending = g_last_rename_seq > g_synced_seq;
+	pthread_mutex_unlock(&g_wal);
+	return pending;
 }
 
 uint64_t wal_synced_seq(void)

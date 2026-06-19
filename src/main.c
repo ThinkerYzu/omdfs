@@ -331,12 +331,17 @@ static int omdfs_rmdir(const char *path)
 	int r = meta_remove_entry(parent, name);
 	if (r != 0)
 		return r;
+	/* Drain + drop the removed dir's own cached index FIRST: a pending async index
+	 * write-back for it would otherwise resurrect the cache dir and index we are
+	 * about to remove (write_index_buf mkdirs its target off the lock). meta_forget
+	 * waits out any in-flight write before dropping the node, so the removal below
+	 * can't race it. */
+	meta_forget(path);
 	char cp[PATH_MAX], ip[PATH_MAX];
 	cache_path(cp, path);
 	snprintf(ip, sizeof(ip), "%s/%s", cp, OMDFS_INDEX_NAME);
 	unlink(ip);
 	rmdir(cp); /* best-effort */
-	meta_forget(path); /* the removed dir's own cached index is now stale */
 	wal_append(WAL_RMDIR, path, NULL);
 	syncer_kick();
 	return 0;
@@ -363,6 +368,14 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	if (isfile)
 		content_prefetch(from); /* best-effort */
 
+	/* Drain + drop the from-subtree's cached indexes BEFORE physically moving its
+	 * cache directory below: a pending async index write-back keyed to an old path
+	 * would otherwise recreate (resurrect) the source cache dir after the move
+	 * (write_index_buf mkdirs its target off the lock). meta_forget_tree waits out
+	 * any in-flight write, then drops the stale-keyed nodes so they reparse from the
+	 * moved files on next access. (A no-op for a file rename.) */
+	meta_forget_tree(from);
+
 	char cfrom[PATH_MAX], cto[PATH_MAX], ctodir[PATH_MAX];
 	cache_path(cfrom, from);
 	cache_path(cto, to);
@@ -384,11 +397,16 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	 * their dirty-set membership so the syncer still finds them. (meta_move_entry
 	 * already re-flags the destination parent if the moved entry itself is dirty.) */
 	dirtyset_rename(from, to);
+	/* Path-based dirty-set re-keying races with the syncer's own re-arm of stale
+	 * paths (a cycle that took the set, then saturated/failed and re-added the
+	 * pre-rename path): the moved subtree's dirty dirs can be lost, leaving dirty
+	 * content that the targeted flush never revisits (only a full --resync would).
+	 * For a directory rename (which moves whole subtrees), force the next flush to
+	 * do a full tree walk so every dirty entry is found at its current path
+	 * regardless of those races. A file rename can't strand a subtree. */
+	if (!isfile)
+		dirtyset_force_full();
 	evict_rename(from, to);
-	/* A renamed directory's on-disk cache subtree (its own + descendants'
-	 * .omdfs.dir files) moved to new paths; drop the now stale-keyed cached
-	 * indexes so they reparse from the moved files. (No-op for a file.) */
-	meta_forget_tree(from);
 	wal_append(WAL_RENAME, from, to);
 	syncer_kick();
 	return 0;
@@ -789,17 +807,26 @@ int main(int argc, char **argv)
 	/* Publish an initial status file so an operator sees the mount come up even
 	 * before the first sync cycle. */
 	status_init();
+	/* Start the async index-writer thread before the syncer (which clears dirty
+	 * flags) or any FUSE op, so index persistence happens off the metadata lock. */
+	if (meta_init() != 0) {
+		fprintf(stderr, "omdfs: cannot start index writer\n");
+		free(fuse_argv);
+		return 1;
+	}
 	/* The syncer drains any WAL/dirty state left by a previous run (recovery)
 	 * and then keeps the backend in sync while we serve the mount. */
 	if (syncer_start() != 0) {
 		fprintf(stderr, "omdfs: cannot start syncer\n");
+		meta_shutdown();
 		free(fuse_argv);
 		return 1;
 	}
 
 	int ret = fuse_main(fuse_argc, fuse_argv, &omdfs_ops, NULL);
 
-	syncer_stop(); /* final drain so pending mutations reach the backend */
+	syncer_stop();   /* final drain so pending mutations reach the backend */
+	meta_shutdown(); /* then flush all pending index writes (after the above) */
 	free(fuse_argv);
 	return ret;
 }

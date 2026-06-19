@@ -17,8 +17,10 @@
 #include "content.h"
 
 #include "evict.h"
+#include "journal.h"
 #include "meta.h"
 #include "omdfs.h"
+#include "syncer.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -27,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FETCH_BUF (128 * 1024)
@@ -97,6 +100,26 @@ static void fetch_unref(struct fetch *f)
 	}
 }
 
+/* Open the backend source for a fetch, tolerating a not-yet-applied rename. If
+ * the file is missing because a structural rename hasn't reached the backend yet
+ * (the cache moved the file to a new path but the backend still holds it at the
+ * old one — e.g. the file was evicted, then a directory rename moved it), kick the
+ * syncer to drain the rename and retry. Without this, re-fetching an evicted file
+ * in a freshly-renamed subtree would fail ENOENT until the rename happened to
+ * drain. Bounded (> the syncer's max backoff) so a genuine miss or a down backend
+ * still fails in reasonable time. */
+static int open_backend_for_fetch(const char *bp)
+{
+	int sfd = open(bp, O_RDONLY);
+	for (int tries = 0; sfd < 0 && errno == ENOENT &&
+			    wal_has_pending_rename() && tries < 150; tries++) {
+		syncer_kick();
+		nanosleep(&(struct timespec){ 0, 100 * 1000 * 1000 }, NULL); /* 100ms */
+		sfd = open(bp, O_RDONLY);
+	}
+	return sfd;
+}
+
 static void *fetch_thread(void *arg)
 {
 	struct fetch *f = arg;
@@ -105,7 +128,7 @@ static void *fetch_thread(void *arg)
 
 	int err = 0;
 	off_t total = 0;
-	int sfd = open(bp, O_RDONLY);
+	int sfd = open_backend_for_fetch(bp);
 	if (sfd < 0) {
 		err = -errno;
 	} else {

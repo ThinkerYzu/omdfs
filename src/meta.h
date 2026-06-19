@@ -90,6 +90,18 @@ int meta_dir_stat(const char *fuse_dir, struct stat *st, size_t *count);
 int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
 		    uint8_t clear_bits);
 
+/* Claim a dirty entry for flushing: deep-copy its current state into *out (caller
+ * frees out->name / out->link) and atomically clear its dirty bits, returning the
+ * bits cleared in *cleared. The flush then pushes *out; if it fails the caller
+ * restores the bits via meta_mark_flags(.. set=*cleared ..). Clearing the flag at
+ * snapshot time (not after the push) closes the lost-update race where a mutation
+ * re-dirties the entry between push and clear and is then dropped. Returns 0 on a
+ * successful claim, 1 if the entry is no longer dirty (nothing to do), or -errno
+ * (ENOENT if the dir/entry is gone; EIO if the cleared flags couldn't persist —
+ * left dirty + re-armed). */
+int meta_flush_claim(const char *fuse_dir, const char *name,
+		     struct omdfs_entry *out, uint8_t *cleared);
+
 /* Mark every child of `fuse_dir` dirty so the background syncer re-pushes it:
  * OMDFS_F_DIRTY_ATTR on every entry, plus OMDFS_F_DIRTY_CONTENT on regular files
  * whose content is cached (symlinks carry no flushable state, only existence).
@@ -154,5 +166,25 @@ int meta_evict_cold(const char *fuse_dir);
 
 /* Release an index loaded by meta_get_index(). */
 void meta_free_index(struct omdfs_index *idx);
+
+/* Asynchronous index write-back (see DESIGN.md). The mutators above persist the
+ * on-disk `.omdfs.dir` by handing the change to a dedicated writer thread instead
+ * of fsync-ing under the metadata lock, so a foreground op no longer stalls behind
+ * a writer's disk flush. Local metadata durability is therefore best-effort within
+ * one write-back cycle, made fully durable by meta_shutdown on a clean unmount. */
+
+/* Start the writer thread (mount). Call before the syncer/any FUSE op. Returns 0
+ * or -errno; before it runs, mutations persist synchronously. */
+int meta_init(void);
+
+/* Drain all pending index writes and stop the writer thread (unmount). Call after
+ * syncer_stop so the final dirty-flag clears also persist. Idempotent. */
+void meta_shutdown(void);
+
+/* Index write-back state for the status file (any out param may be NULL):
+ * *pending = directories queued for write, *last_errno = the most recent write
+ * failure (0 if the last write succeeded), *path = that failure's directory. */
+void meta_writeback_status(int *pending, int *last_errno, char *path,
+			   size_t pathsz);
 
 #endif /* OMDFS_META_H */

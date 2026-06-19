@@ -37,6 +37,11 @@
 #                      flush-paused with a non-zero dirty backlog; removing the file
 #                      resumes flushing and the backlog drains. Structural ops keep
 #                      syncing while paused.
+#   N. async index   — the on-disk .omdfs.dir is persisted off the metadata lock by a
+#                      writer thread: a burst of mutations to one directory coalesces
+#                      and the status backlog drains to 0; a clean unmount flushes every
+#                      pending write so the listing survives a remount; and rmdir'ing a
+#                      directory with a pending index write does not resurrect its index.
 #
 # Usage: tests/hardening.sh [path-to-omdfs-binary]   (default: ./omdfs)
 
@@ -526,6 +531,55 @@ rm -f "$M/data/state/flush-off"
 mdrains() { [ "$(cat "$M/backend/bootfile" 2>/dev/null)" = boot ]; }
 wait_for "removing the file resumes flushing on a --no-flush mount" mdrains
 fusermount3 -u "$M/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
+
+# ============================================================
+# N. async index write-back: coalescing, drain-on-unmount, no resurrection
+# ============================================================
+# The on-disk .omdfs.dir is persisted asynchronously by a dedicated writer thread
+# (off the metadata lock). This checks the three things that must hold: a burst of
+# mutations to one directory coalesces and drains (status backlog returns to 0); a
+# clean unmount flushes every pending index write so the listing survives a remount;
+# and rmdir'ing a directory with a pending index write does not let a late write-back
+# resurrect its on-disk index (the reorder in omdfs_rmdir/rename drains first).
+N="$WORK/n"; mkdir -p "$N/backend" "$N/data" "$N/mnt"
+if ! mount_omdfs "$N/mnt" "$N/omdfs.log" --backend "$N/backend" --datadir "$N/data"; then
+	echo "Bail out! omdfs failed to mount (N); log follows:" >&2; cat "$N/omdfs.log" >&2; exit 98
+fi
+mkdir "$N/mnt/d"
+# Burst of rapid mutations on ONE directory's index (each create + chmod schedules a
+# save; under the burst they coalesce into far fewer writes).
+for i in $(seq 1 60); do echo "v$i" > "$N/mnt/d/f$i"; chmod 600 "$N/mnt/d/f$i"; done
+[ -n "$(status_field "$N/data" index-writeback-pending)" ] \
+	&& ok "status reports index-writeback-pending" \
+	|| no "status reports index-writeback-pending"
+ndrained() { [ "$(status_field "$N/data" index-writeback-pending)" = 0 ]; }
+wait_for "index write-back backlog drains to 0 after a mutation burst" ndrained
+[ "$(ls "$N/mnt/d" | wc -l)" = 60 ] && ok "all 60 rapid creates present in the listing" \
+	|| no "all 60 rapid creates present in the listing (got $(ls "$N/mnt/d" | wc -l))"
+
+# rmdir a directory that has a pending index write-back; it must not be resurrected.
+mkdir "$N/mnt/rd"
+echo x > "$N/mnt/rd/a"   # create in rd -> pins rd's index with a pending write-back
+rm "$N/mnt/rd/a"         # remove -> another pending write-back on rd
+rmdir "$N/mnt/rd"
+[ ! -e "$N/mnt/rd" ] && ok "rmdir'd dir is gone from the mount" \
+	|| no "rmdir'd dir is gone from the mount"
+sleep 1                  # give any (buggy) in-flight write-back time to resurrect it
+nresurrect() { [ ! -e "$N/data/cache/rd/$INDEX" ] && [ ! -d "$N/data/cache/rd" ]; }
+wait_for "rmdir'd dir's cache index is not resurrected by a pending write-back" nresurrect
+
+# Clean unmount must flush every pending index write (meta_shutdown drain); the full
+# listing then survives a remount, served from the on-disk index alone.
+fusermount3 -u "$N/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
+if ! mount_omdfs "$N/mnt" "$N/omdfs2.log" --backend "$N/backend" --datadir "$N/data"; then
+	echo "Bail out! omdfs failed to remount (N); log follows:" >&2; cat "$N/omdfs2.log" >&2; exit 98
+fi
+[ "$(ls "$N/mnt/d" | wc -l)" = 60 ] \
+	&& ok "all 60 entries survive a clean unmount/remount (index drain)" \
+	|| no "all 60 entries survive a clean unmount/remount (got $(ls "$N/mnt/d" | wc -l))"
+[ ! -e "$N/mnt/rd" ] && ok "rmdir'd dir stays gone after remount (no resurrection)" \
+	|| no "rmdir'd dir stays gone after remount (no resurrection)"
+fusermount3 -u "$N/mnt" >/dev/null 2>&1; wait "$PID" 2>/dev/null
 
 # ---- summary ----
 echo "1..$COUNT"

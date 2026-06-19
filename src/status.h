@@ -38,6 +38,9 @@ struct omdfs_status {
 	long long last_mark_epoch; /* secs of the last operator-triggered mark-dirty (0 = never) */
 	char last_mark[256];       /* one-line summary of that mark-dirty ("" = never run) */
 	long cold_evicted;         /* cold metadata indexes reclaimed since mount */
+	int index_pending;         /* directories queued for async index write-back */
+	int index_errno;           /* last index write-back failure (0 if none) */
+	char index_path[PATH_MAX]; /* directory of that last failure ("" if none) */
 };
 
 /* Record the daemon start and write an initial "starting" status file. Call once

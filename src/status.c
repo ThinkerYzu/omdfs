@@ -86,6 +86,14 @@ void status_publish(const struct omdfs_status *s)
 	else
 		snprintf(errbuf, sizeof(errbuf), "-");
 
+	char idxerr[PATH_MAX + 64];
+	if (s->index_errno)
+		snprintf(idxerr, sizeof(idxerr), "%d (%s) at %s", s->index_errno,
+			 strerror(s->index_errno),
+			 s->index_path[0] ? s->index_path : "?");
+	else
+		snprintf(idxerr, sizeof(idxerr), "-");
+
 	char body[2 * PATH_MAX + 1024];
 	int len = snprintf(body, sizeof(body),
 		"omdfs status\n"
@@ -109,7 +117,9 @@ void status_publish(const struct omdfs_status *s)
 		"last-resync-result: %s\n"
 		"last-mark-dirty: %s\n"
 		"last-mark-dirty-result: %s\n"
-		"cold-meta-evicted: %ld\n",
+		"cold-meta-evicted: %ld\n"
+		"index-writeback-pending: %d\n"
+		"index-writeback-error: %s\n",
 		overall(s), now_s, started_s, last_s,
 		s->pending_structural, s->dirty_files, s->dirty_bytes,
 		s->cache_bytes, s->cache_budget, s->cache_hard_limit,
@@ -117,7 +127,8 @@ void status_publish(const struct omdfs_status *s)
 		s->flush_disabled ? "disabled" : "enabled",
 		s->stuck ? "yes" : "no",
 		stuck_op, stuck_path, errbuf, resync_s, resync_res,
-		mark_s, mark_res, s->cold_evicted);
+		mark_s, mark_res, s->cold_evicted,
+		s->index_pending, idxerr);
 	if (len < 0)
 		return;
 	if (len > (int)sizeof(body))

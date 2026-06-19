@@ -18,6 +18,7 @@
 #include "evict.h"
 
 #include "content.h"
+#include "journal.h"
 #include "lru.h"
 #include "meta.h"
 #include "omdfs.h"
@@ -185,7 +186,14 @@ void evict_run_if_needed(void)
 	if (!g_budget)
 		return;
 
-	if (lru_total() > g_high) {
+	/* Don't evict while a structural rename has not yet reached the backend: the
+	 * backend namespace can lag the cache, so a clean file's content may still
+	 * sit at its OLD backend path. Dropping its cache copy now would make a
+	 * refetch at the file's current path fail ENOENT (the rename hasn't moved the
+	 * backend copy yet). Skip this sweep; the cache may transiently exceed the
+	 * budget (bounded by the 2x hard limit) and eviction catches up once the
+	 * rename drains. The backpressure latch is still refreshed below. */
+	if (!wal_has_pending_rename() && lru_total() > g_high) {
 		pthread_mutex_lock(&evict_mtx);
 		while (lru_total() > g_low) {
 			char cand[EVICT_BATCH][PATH_MAX];
