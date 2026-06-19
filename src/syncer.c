@@ -372,19 +372,28 @@ static int copy_file(const char *src, const char *dst)
 	return 0;
 }
 
-/* Best-effort apply of a (file/dir) entry's logical attributes to the backend. */
-static void apply_stat_attrs(const char *bp, const struct stat *s)
+/* Apply a (file/dir) entry's logical attributes to the backend. Returns 0 if the
+ * target was reached, or -errno if it was not — which the flush's retry contract
+ * reads as "backend path not ready yet, retry" (see flush_entry). We key that
+ * signal on chmod alone: chmod on a path we own succeeds whatever the mode bits,
+ * so its only realistic failure is the path being absent (its create/mkdir/rename
+ * hasn't drained). chown and utimens failures are deliberately ignored — chown
+ * needs privilege we usually lack, and treating that as "not ready" would retry
+ * such an entry forever. */
+static int apply_stat_attrs(const char *bp, const struct stat *s)
 {
-	int ignored = chmod(bp, s->st_mode & 07777);
-	ignored = chown(bp, s->st_uid, s->st_gid); /* needs privilege */
+	if (chmod(bp, s->st_mode & 07777) != 0)
+		return -errno;
+	int ignored = chown(bp, s->st_uid, s->st_gid); /* needs privilege */
 	(void)ignored;
 	struct timespec ts[2] = { s->st_atim, s->st_mtim };
 	utimensat(AT_FDCWD, bp, ts, 0);
+	return 0;
 }
 
-static void apply_attrs(const char *bp, const struct omdfs_entry *e)
+static int apply_attrs(const char *bp, const struct omdfs_entry *e)
 {
-	apply_stat_attrs(bp, &e->st);
+	return apply_stat_attrs(bp, &e->st);
 }
 
 /* ---- phase 1: structural drain ---- */
@@ -503,7 +512,8 @@ static void phase_structural(struct omdfs_status *st)
 
 /* Flush one dirty entry to the backend, then either clear its flags (success) or
  * leave it dirty and account the still-pending backlog + re-arm its directory
- * (failure). Runs on a pool worker, so all shared-state touches are thread-safe:
+ * (failure — see "the retry contract" at the push below for when and why a push
+ * fails). Runs on a pool worker, so all shared-state touches are thread-safe:
  * meta_mark_flags / dirtyset_add are internally locked, the status counters are
  * guarded by s_stat_mtx.
  *
@@ -543,19 +553,42 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 	if (c != 0)
 		return; /* gone, no longer dirty, or save failed (already re-armed) */
 
+	/* The retry contract.
+	 * --------------------
+	 * This phase-2 flush pushes each dirty entry to its *current* backend path and
+	 * is order-independent and idempotent. A push that fails is NOT an error — it
+	 * means "the backend isn't ready for this entry yet", so we keep the entry dirty
+	 * and try again on a later cycle (the `if (!ok)` block below restores the
+	 * just-claimed flags and re-arms the directory in the dirty-set).
+	 *
+	 * A push can fail even though the local mutation already succeeded, because an
+	 * entry's *existence and location* on the backend is owned by phase 1 (the
+	 * structural WAL: create / mkdir / rename), which drains on its own schedule and
+	 * can lag this flush. In fact the dirty flag is armed *before* the matching WAL
+	 * record is even appended (e.g. omdfs_create/omdfs_mkdir set the flag and call
+	 * dirtyset_add, then wal_append), so a flush can reach an entry whose
+	 * create/mkdir/rename has not reached the backend yet. Its backend path then
+	 * does not exist (or still sits at the pre-rename name), and:
+	 *   - content: copy_file's open of the destination fails, and
+	 *   - attrs:   chmod of the destination fails (ENOENT).
+	 * Either way the path will exist once phase 1 catches up, so we retry rather than
+	 * drop the change — dropping it would lose the write/chmod until a full --resync.
+	 * `ok` tracks "did the push land". */
 	int ok = 1;
 	if (claimed & OMDFS_F_DIRTY_CONTENT) {
 		char cp[PATH_MAX];
 		cache_path(cp, fpath);
 		if (copy_file(cp, bp) == 0)
-			apply_attrs(bp, &cur);
+			apply_attrs(bp, &cur); /* contents landed, now its labels */
 		else
-			ok = 0; /* backend path not ready yet; retry */
+			ok = 0; /* backend path not ready — retry (see the contract above) */
 	} else if (claimed & OMDFS_F_DIRTY_ATTR) {
-		apply_attrs(bp, &cur);
+		if (apply_attrs(bp, &cur) != 0)
+			ok = 0; /* backend path not ready — retry (see the contract above) */
 	}
 	if (!ok) {
-		/* Restore the claimed bits so the next cycle retries; count backlog. */
+		/* The push didn't land: restore the claimed bits so the next cycle retries,
+		 * and re-add the dir to the dirty-set so the syncer revisits it. */
 		meta_mark_flags(fuse_dir, e->name, claimed, 0);
 		pthread_mutex_lock(&s_stat_mtx);
 		st->dirty_files++;
