@@ -25,6 +25,7 @@ test: $(BIN)
 	@tests/crash-recovery.sh ./$(BIN)
 	@tests/eviction.sh ./$(BIN)
 	@tests/hardening.sh ./$(BIN)
+	@tests/clobber.sh ./$(BIN)
 
 # Differential consistency stress test (not part of `make test`; can be long).
 # Knobs: STRESS_SEED STRESS_OPS STRESS_ROUNDS STRESS_CACHE STRESS_MAXSZ.

@@ -14,6 +14,7 @@
 #include "dirtyset.h"
 #include "journal.h"
 #include "omdfs.h"
+#include "syncer.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -156,9 +157,36 @@ static int idx_push(struct omdfs_index *idx, const struct omdfs_entry *e)
 	return 0;
 }
 
+/* Release a canonical entry's indirection as the entry goes away (removed, or its
+ * whole index freed). If structural ops are still pending against it, the
+ * pending-op queue still references it: detach (the next decrement to 0 frees it).
+ * Otherwise free it now. NULL-safe and a no-op on reader copies (ind == NULL).
+ * meta_mtx held for any entry that actually carries an ind. */
+static void ind_release(struct omdfs_entry *e)
+{
+	struct ind *in = e->ind;
+	if (!in)
+		return;
+	e->ind = NULL;
+	if (in->pending_count > 0)
+		in->detached = 1; /* queue owns it now; freed when it drains to 0 */
+	else
+		free(in);
+}
+
+/* Ensure `e` has an indirection, allocating it lazily. Returns it, or NULL on OOM.
+ * meta_mtx held. */
+static struct ind *ind_ensure(struct omdfs_entry *e)
+{
+	if (!e->ind)
+		e->ind = calloc(1, sizeof(*e->ind));
+	return e->ind;
+}
+
 void meta_free_index(struct omdfs_index *idx)
 {
 	for (size_t i = 0; i < idx->n; i++) {
+		ind_release(&idx->entries[i]);
 		free(idx->entries[i].name);
 		free(idx->entries[i].link);
 	}
@@ -499,6 +527,22 @@ static int cnode_pinned(const struct cnode *n)
 	return n->save_dirty || n->save_inflight;
 }
 
+/* True if any entry in `n` has an appended-but-undrained structural op. Such a
+ * node must NOT be LRU-evicted: dropping it and reparsing from disk would reset
+ * those entries' pending_count to 0, so the flush gate would no longer hold them
+ * back and the not-yet-drained rename/create could clobber a freshly-flushed path
+ * (DESIGN.md § 2026-06-19). Cheap: scanned only when LRU eviction is considering
+ * this node as a victim (rare; needs > META_CACHE_MAX cached dirs). */
+static int cnode_has_pending(const struct cnode *n)
+{
+	for (size_t i = 0; i < n->idx.n; i++) {
+		const struct ind *in = n->idx.entries[i].ind;
+		if (in && in->pending_count > 0)
+			return 1;
+	}
+	return 0;
+}
+
 /* meta_mtx held. Append a node to the writer queue (enqueued at most once). */
 static void wq_push(struct cnode *n)
 {
@@ -711,7 +755,7 @@ static struct cnode *cache_insert(const char *dir, struct omdfs_index *idx)
 	 * may transiently exceed budget by the in-flight count — bounded and fine. */
 	for (struct cnode *v = lru_tail; v && cache_count > META_CACHE_MAX;) {
 		struct cnode *prev = v->lru_prev;
-		if (v != n && !cnode_pinned(v))
+		if (v != n && !cnode_pinned(v) && !cnode_has_pending(v))
 			cache_remove_node(v);
 		v = prev;
 	}
@@ -732,6 +776,7 @@ static int idx_copy(struct omdfs_index *dst, const struct omdfs_index *src)
 	dst->cap = src->n;
 	for (size_t i = 0; i < src->n; i++) {
 		struct omdfs_entry e = src->entries[i];
+		e.ind = NULL; /* the indirection is canonical-only; never copied out */
 		e.name = strdup(src->entries[i].name);
 		e.link = src->entries[i].link ? strdup(src->entries[i].link)
 					      : NULL;
@@ -1132,6 +1177,11 @@ int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
 	return r;
 }
 
+/* Defined below (with the rest of the flush-gate / in-flight-registry helpers),
+ * but used here by meta_flush_claim. */
+static int flushable_locked(const char *dir, const char *name);
+static void flushing_add_locked(const char *path);
+
 int meta_flush_claim(const char *fuse_dir, const char *name,
 		     struct omdfs_entry *out, uint8_t *cleared)
 {
@@ -1152,11 +1202,21 @@ int meta_flush_claim(const char *fuse_dir, const char *name,
 		pthread_mutex_unlock(&meta_mtx);
 		return 1; /* no longer dirty: another path handled it */
 	}
+	/* Re-check the flush gate atomically with the claim: a structural op may have
+	 * arrived for this entry (or an ancestor) since flush_submit's cheaper
+	 * pre-check, e.g. another file was just renamed onto this path. If so, don't
+	 * push — leave it dirty and tell the caller to re-arm (return 2). This is what
+	 * keeps a barrier-free overlap from flushing an entry whose rename is undrained. */
+	if (!flushable_locked(fuse_dir, name)) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 2; /* gated: still dirty, caller re-arms */
+	}
 	/* Deep-copy the entry's *current* state for the caller to push, then clear
 	 * the dirty bits atomically. A mutation that re-dirties this entry after we
 	 * unlock re-sets the bits (so it is re-flushed next cycle) instead of being
 	 * lost when the push completes and the flag is cleared. */
 	*out = *e;
+	out->ind = NULL; /* canonical-only; the flush worker must not touch it */
 	out->name = strdup(e->name);
 	out->link = e->link ? strdup(e->link) : NULL;
 	if (!out->name || (e->link && !out->link)) {
@@ -1179,6 +1239,15 @@ int meta_flush_claim(const char *fuse_dir, const char *name,
 		return -EIO;
 	}
 	*cleared = d;
+	/* Register the path we are about to push so the next cycle's phase 1 defers a
+	 * concurrent rename/unlink of it (Change 3). Atomic with the claim under
+	 * meta_mtx. The caller pairs this with meta_flush_release after the push. */
+	char fpath[PATH_MAX];
+	if (fuse_dir[0] == '/' && fuse_dir[1] == '\0')
+		snprintf(fpath, sizeof(fpath), "/%s", name);
+	else
+		snprintf(fpath, sizeof(fpath), "%s/%s", fuse_dir, name);
+	flushing_add_locked(fpath);
 	pthread_mutex_unlock(&meta_mtx);
 	return 0;
 }
@@ -1295,9 +1364,14 @@ int meta_add_entry(const char *fuse_dir, const struct omdfs_entry *e)
 	return r;
 }
 
-/* meta_mtx held. Drop entry at index i (swap with last; order is irrelevant). */
-static void drop_at(struct omdfs_index *idx, size_t i)
+/* meta_mtx held. Drop entry at index i (swap with last; order is irrelevant).
+ * When `release_ind` is set the entry is genuinely going away, so release its
+ * indirection; a caller that has *transferred* the indirection to another entry
+ * (a cross-directory move) passes 0 so the live ind isn't detached/freed. */
+static void drop_at(struct omdfs_index *idx, size_t i, int release_ind)
 {
+	if (release_ind)
+		ind_release(&idx->entries[i]);
 	free(idx->entries[i].name);
 	free(idx->entries[i].link);
 	idx->entries[i] = idx->entries[--idx->n];
@@ -1318,7 +1392,7 @@ int meta_remove_entry(const char *fuse_dir, const char *name)
 		pthread_mutex_unlock(&meta_mtx);
 		return -ENOENT;
 	}
-	drop_at(idx, (size_t)(e - idx->entries));
+	drop_at(idx, (size_t)(e - idx->entries), 1 /* real removal: release ind */);
 	r = meta_schedule_save(cnode_of(idx));
 	if (r != 0)
 		cache_drop(fuse_dir);
@@ -1327,11 +1401,13 @@ int meta_remove_entry(const char *fuse_dir, const char *name)
 }
 
 int meta_move_entry(const char *old_dir, const char *old_name,
-		    const char *new_dir, const char *new_name)
+		    const char *new_dir, const char *new_name, int *dst_dirty_out,
+		    struct ind **moved_ind)
 {
 	pthread_mutex_lock(&meta_mtx);
 	int r;
 	int dst_dirty = 0; /* moved entry carries dirty flags -> new_dir is dirty */
+	struct ind *bumped = NULL; /* moved entry's ind, pre-bumped for the rename */
 
 	if (!strcmp(old_dir, new_dir)) {
 		struct omdfs_index *idx = cache_canonical(old_dir, &r);
@@ -1344,7 +1420,7 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		}
 		struct omdfs_entry *t = meta_lookup(idx, new_name);
 		if (t && t != e)
-			drop_at(idx, (size_t)(t - idx->entries));
+			drop_at(idx, (size_t)(t - idx->entries), 1 /* target gone */);
 		/* meta_lookup pointer may have moved after drop_at swap. */
 		e = meta_lookup(idx, old_name);
 		char *nn = strdup(new_name);
@@ -1353,16 +1429,27 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 			goto out;
 		}
 		free(e->name);
-		e->name = nn;
+		e->name = nn; /* in-place rename: e keeps its ind */
 		idx_hash_drop(idx); /* name changed in place: invalidate the hash */
 		dst_dirty = (e->flags & OMDFS_F_DIRTY) != 0;
 		r = meta_schedule_save(cnode_of(idx));
-		if (r != 0)
+		if (r != 0) {
 			cache_drop(old_dir);
+		} else {
+			/* Bump the rename's pending_count while still under the lock, so
+			 * any flush that observes the (dirty) moved entry also observes
+			 * count>0 and defers — closing the publish window. Done only after
+			 * the last fallible step so a failure can't strand the count. */
+			bumped = ind_ensure(e);
+			if (bumped)
+				bumped->pending_count++;
+		}
 		goto out;
 	}
 
-	/* Cross-directory: extract from old, insert into new, carrying flags. */
+	/* Cross-directory: extract from old, insert into new, carrying flags AND the
+	 * indirection (so a pending structural-op count survives the move with the
+	 * entry). */
 	struct omdfs_index *oidx = cache_canonical(old_dir, &r);
 	if (!oidx)
 		goto out;
@@ -1371,7 +1458,7 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		r = -ENOENT;
 		goto out;
 	}
-	struct omdfs_entry moved = *e;
+	struct omdfs_entry moved = *e; /* carries moved.ind = e->ind (transferred) */
 	dst_dirty = (moved.flags & OMDFS_F_DIRTY) != 0;
 	moved.name = strdup(new_name);
 	moved.link = e->link ? strdup(e->link) : NULL;
@@ -1381,7 +1468,8 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		r = -ENOMEM;
 		goto out;
 	}
-	drop_at(oidx, (size_t)(e - oidx->entries));
+	/* release_ind = 0: the ind now lives on `moved`, so don't detach/free it. */
+	drop_at(oidx, (size_t)(e - oidx->entries), 0);
 	r = meta_schedule_save(cnode_of(oidx));
 	if (r != 0) {
 		cache_drop(old_dir);
@@ -1400,7 +1488,7 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 	}
 	struct omdfs_entry *t = meta_lookup(nidx, new_name);
 	if (t)
-		drop_at(nidx, (size_t)(t - nidx->entries));
+		drop_at(nidx, (size_t)(t - nidx->entries), 1 /* target gone */);
 	if (idx_push(nidx, &moved) != 0) {
 		free(moved.name);
 		free(moved.link);
@@ -1408,13 +1496,26 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		goto out;
 	}
 	r = meta_schedule_save(cnode_of(nidx));
-	if (r != 0)
+	if (r != 0) {
 		cache_drop(new_dir);
+	} else {
+		/* Bump on the entry now living in nidx (see the same-dir branch). */
+		bumped = ind_ensure(&nidx->entries[nidx->n - 1]);
+		if (bumped)
+			bumped->pending_count++;
+	}
 
 out:
 	pthread_mutex_unlock(&meta_mtx);
-	if (r == 0 && dst_dirty)
-		dirtyset_add(new_dir);
+	/* Publication of the moved entry to the dirty-set is deferred to the caller
+	 * (after wal_append + meta_pending_commit), so the flush never sees it dirty
+	 * and settled while the rename is undrained — see DESIGN.md Change 1. The
+	 * pre-bumped count is handed back for the caller to commit with the WAL seq;
+	 * on a failed move there is nothing pending. */
+	if (dst_dirty_out)
+		*dst_dirty_out = (r == 0) ? dst_dirty : 0;
+	if (moved_ind)
+		*moved_ind = (r == 0) ? bumped : NULL;
 	return r;
 }
 
@@ -1489,6 +1590,239 @@ int meta_set(const char *fuse_dir, const char *name, const struct stat *src,
 	if (r == 0 && (dirty & OMDFS_F_DIRTY))
 		dirtyset_add(fuse_dir);
 	return r;
+}
+
+/* ---- per-entry structural-op accounting (the pending-op queue) ----
+ *
+ * Each create/mkdir/rename bumps the affected entry's pending_count right after its
+ * WAL record is appended, and records (seq -> indirection) here. The syncer
+ * decrements via meta_pending_drain once phase 1 has applied that seq — using the
+ * queued indirection pointer, never the WAL record's path (which is stale after a
+ * rename). The on-disk WAL stays the recovery log; the syncer holds off real
+ * flushing until the recovered WAL has fully drained once (see the syncer's
+ * s_initial_drained), so recovered ops need no counts and every count here covers a
+ * post-mount op. All state under meta_mtx. */
+struct pending_op {
+	uint64_t seq;
+	struct ind *ind;
+	struct pending_op *next;
+};
+static struct pending_op *pq_head;
+/* Highest WAL seq the syncer has reported drained. A structural op can race: phase 1
+ * applies + drains seq S before the foreground that appended S gets here to record
+ * its count. The watermark makes meta_pending_add a no-op for an already-drained seq,
+ * so the count never leaks (it would otherwise stay >0 forever, the op being already
+ * past drain). Both sides act under meta_mtx, so the check-and-act is atomic. */
+static uint64_t g_drained_seq;
+
+int meta_pending_add(const char *dir, const char *name, uint64_t seq)
+{
+	if (seq == 0)
+		return 0; /* the wal_append failed; nothing to account */
+	pthread_mutex_lock(&meta_mtx);
+	if (seq <= g_drained_seq) {
+		/* Phase 1 already drained this op (it raced ahead of us): there is
+		 * nothing pending, so don't bump — a bump now would never be matched
+		 * by a decrement and would strand the count. */
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
+	struct cnode *n = cache_find(dir);
+	struct omdfs_entry *e = n ? meta_lookup(&n->idx, name) : NULL;
+	if (!e) {
+		/* The entry vanished between the append and here (a racing op). The
+		 * WAL op still drains, but there is no live entry to gate. Skip: drain
+		 * pops only queued seqs, so the queue stays consistent. */
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
+	struct pending_op *p = malloc(sizeof(*p));
+	if (!p) {
+		pthread_mutex_unlock(&meta_mtx);
+		return -ENOMEM;
+	}
+	if (!e->ind) {
+		e->ind = calloc(1, sizeof(*e->ind));
+		if (!e->ind) {
+			free(p);
+			pthread_mutex_unlock(&meta_mtx);
+			return -ENOMEM;
+		}
+	}
+	e->ind->pending_count++;
+	p->seq = seq;
+	p->ind = e->ind;
+	p->next = pq_head;
+	pq_head = p; /* unordered; drain scans for seq <= applied */
+	pthread_mutex_unlock(&meta_mtx);
+	return 0;
+}
+
+void meta_pending_drain(uint64_t applied_seq)
+{
+	int woke = 0;
+	pthread_mutex_lock(&meta_mtx);
+	if (applied_seq > g_drained_seq)
+		g_drained_seq = applied_seq;
+	struct pending_op **pp = &pq_head;
+	while (*pp) {
+		struct pending_op *p = *pp;
+		if (p->seq > applied_seq) {
+			pp = &p->next;
+			continue;
+		}
+		*pp = p->next; /* unlink this drained op */
+		struct ind *in = p->ind;
+		free(p);
+		if (in->pending_count > 0)
+			in->pending_count--;
+		if (in->pending_count == 0) {
+			if (in->detached)
+				free(in); /* entry gone; this was its last op */
+			else
+				woke = 1; /* a live entry just became flushable */
+		}
+	}
+	pthread_mutex_unlock(&meta_mtx);
+	if (woke)
+		syncer_kick(); /* run a cycle to flush the newly-settled entries */
+}
+
+void meta_pending_commit(struct ind *in, uint64_t seq)
+{
+	if (!in)
+		return; /* the move bumped nothing (OOM, or no move) */
+	pthread_mutex_lock(&meta_mtx);
+	/* seq == 0: the wal_append failed, so no record will ever drain this bump.
+	 * seq <= g_drained_seq: phase 1 already applied + drained the rename between
+	 * the append and here, so there is nothing left pending. Either way, roll the
+	 * pre-bump back. Otherwise queue the (seq -> ind) decrement. */
+	int rollback = (seq == 0 || seq <= g_drained_seq);
+	struct pending_op *p = rollback ? NULL : malloc(sizeof(*p));
+	if (rollback || !p) {
+		if (in->pending_count > 0)
+			in->pending_count--;
+		if (in->pending_count == 0 && in->detached)
+			free(in);
+		pthread_mutex_unlock(&meta_mtx);
+		return;
+	}
+	p->seq = seq;
+	p->ind = in;
+	p->next = pq_head;
+	pq_head = p;
+	pthread_mutex_unlock(&meta_mtx);
+}
+
+/* The flush gate, meta_mtx held. 1 if child `name` in `dir` and every ancestor
+ * directory have pending_count == 0. */
+static int flushable_locked(const char *dir, const char *name)
+{
+	struct cnode *n = cache_find(dir);
+	struct omdfs_entry *e = n ? meta_lookup(&n->idx, name) : NULL;
+	if (e && e->ind && e->ind->pending_count > 0)
+		return 0; /* the entry's own create/rename is undrained */
+
+	/* Walk the ancestor directories: a pending mkdir/rename on an ancestor moves
+	 * E's backend path without touching E's own count, so each ancestor dir's
+	 * entry (which lives in *its* parent) must also be settled. A dir with a
+	 * pending op keeps its parent cnode pinned (cnode_has_pending), so a cache
+	 * miss here means no pending op — treat it as settled. */
+	char cur[PATH_MAX];
+	snprintf(cur, sizeof(cur), "%s", dir);
+	while (!(cur[0] == '/' && cur[1] == '\0')) {
+		char pdir[PATH_MAX], pname[PATH_MAX];
+		omdfs_split_path(cur, pdir, pname);
+		struct cnode *pn = cache_find(pdir);
+		struct omdfs_entry *pe = pn ? meta_lookup(&pn->idx, pname) : NULL;
+		if (pe && pe->ind && pe->ind->pending_count > 0)
+			return 0;
+		snprintf(cur, sizeof(cur), "%s", pdir);
+	}
+	return 1;
+}
+
+int meta_flushable(const char *dir, const char *name)
+{
+	pthread_mutex_lock(&meta_mtx);
+	int ok = flushable_locked(dir, name);
+	pthread_mutex_unlock(&meta_mtx);
+	return ok;
+}
+
+/* ---- in-flight flush registry (Change 3: barrier-free phase exclusion) ----
+ *
+ * With the per-cycle pool_drain gone, a phase-2 flush worker can be copying to a
+ * backend path P while the next cycle's phase 1 wants to rename/unlink P. If phase
+ * 1 won, the worker's later rename(tmp, P) would resurrect a just-removed/moved
+ * file. Each worker registers the FUSE path it is flushing here (atomically with
+ * its claim, under meta_mtx); phase 1 checks the path before draining a rename or
+ * unlink of it and defers while it is registered. The set is keyed by path (not by
+ * the entry's indirection) so it survives the entry being unlinked mid-flush. */
+#define FLUSHING_BUCKETS 256
+struct fnode {
+	char *path;
+	struct fnode *next;
+};
+static struct fnode *flushing_set[FLUSHING_BUCKETS];
+
+/* meta_mtx held. */
+static void flushing_add_locked(const char *path)
+{
+	size_t b = cache_hash(path); /* hashes into META_CACHE_BUCKETS; mask down */
+	b &= (FLUSHING_BUCKETS - 1);
+	struct fnode *f = malloc(sizeof(*f));
+	if (!f)
+		return; /* best-effort: on OOM we skip exclusion (rare; degrades safely) */
+	f->path = strdup(path);
+	if (!f->path) {
+		free(f);
+		return;
+	}
+	f->next = flushing_set[b];
+	flushing_set[b] = f;
+}
+
+/* meta_mtx held. Remove one node matching `path` (duplicates may exist if the same
+ * path is flushed across two overlapping cycles; each begin pairs with one end). */
+static void flushing_del_locked(const char *path)
+{
+	size_t b = cache_hash(path) & (FLUSHING_BUCKETS - 1);
+	for (struct fnode **pp = &flushing_set[b]; *pp; pp = &(*pp)->next) {
+		if (!strcmp((*pp)->path, path)) {
+			struct fnode *f = *pp;
+			*pp = f->next;
+			free(f->path);
+			free(f);
+			return;
+		}
+	}
+}
+
+int meta_path_flushing(const char *path)
+{
+	pthread_mutex_lock(&meta_mtx);
+	size_t b = cache_hash(path) & (FLUSHING_BUCKETS - 1);
+	int found = 0;
+	for (struct fnode *f = flushing_set[b]; f; f = f->next)
+		if (!strcmp(f->path, path)) {
+			found = 1;
+			break;
+		}
+	pthread_mutex_unlock(&meta_mtx);
+	return found;
+}
+
+void meta_flush_release(const char *dir, const char *name)
+{
+	char fpath[PATH_MAX];
+	if (dir[0] == '/' && dir[1] == '\0')
+		snprintf(fpath, sizeof(fpath), "/%s", name);
+	else
+		snprintf(fpath, sizeof(fpath), "%s/%s", dir, name);
+	pthread_mutex_lock(&meta_mtx);
+	flushing_del_locked(fpath);
+	pthread_mutex_unlock(&meta_mtx);
 }
 
 /* Start the async index-writer thread. Call once at mount, before any FUSE op or

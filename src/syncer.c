@@ -104,6 +104,11 @@ static pthread_cond_t s_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t s_thread;
 static int s_stop, s_kick, s_running;
 static long long s_last_clean; /* epoch of the last fully-drained cycle */
+/* Set once the recovered structural WAL has fully drained. Until then the dirty
+ * flush runs dry — recovered-dirty entries have no pending_count to gate them, so
+ * we must not push one whose recovered rename is still undrained (DESIGN Change 2,
+ * the recovery guard). Touched only on the syncer thread. */
+static int s_initial_drained;
 
 /* Guards the shared status/resync stat counters updated from pool workers. */
 static pthread_mutex_t s_stat_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -431,12 +436,29 @@ static int is_permanent(int err)
 	}
 }
 
+/* apply_structural's "not an error, just retry next pass" signal: a rename/unlink
+ * is deferred because a phase-2 flush is in flight on the same backend path (Change
+ * 3). Distinct from a real errno (all positive) and from 0 (applied). */
+#define SYNC_DEFER (-1)
+
 /* Apply one structural record to the backend. Returns 0 if applied (or
- * idempotently a no-op), else the positive errno to retry on (blocks later ops). */
+ * idempotently a no-op), SYNC_DEFER to retry next pass without blame (a flush holds
+ * the path), else the positive errno to retry on (blocks later ops). */
 static int apply_structural(const struct wal_record *r)
 {
 	char bp[PATH_MAX], bp2[PATH_MAX];
 	backend_path(bp, r->path);
+
+	/* Defer a rename/unlink while a flush is copying to the same backend path: the
+	 * flush's rename(tmp, path) and this structural op must not interleave (a lost
+	 * barrier would let the structural op resurrect a flushed file, or the flush
+	 * recreate a removed one). create/mkdir/rmdir/symlink can't collide with an
+	 * in-flight content push (the gate held the flush until the path existed; an
+	 * rmdir target is empty), so only these two are checked. */
+	if ((r->op == WAL_UNLINK && meta_path_flushing(r->path)) ||
+	    (r->op == WAL_RENAME &&
+	     (meta_path_flushing(r->path) || meta_path_flushing(r->path2))))
+		return SYNC_DEFER;
 
 	switch (r->op) {
 	case WAL_CREATE: {
@@ -493,6 +515,12 @@ static void phase_structural(struct omdfs_status *st)
 			done++;
 			continue;
 		}
+		if (err == SYNC_DEFER) {
+			/* A flush holds this path; stop here (strict in-order) and retry
+			 * next cycle — NOT a stuck failure. The flush completing kicks the
+			 * syncer, so the retry is prompt. */
+			break;
+		}
 		/* Strict in-order: the head op is blocked; surface it and stop. */
 		st->stuck_errno = err;
 		st->stuck = is_permanent(err);
@@ -506,6 +534,10 @@ static void phase_structural(struct omdfs_status *st)
 	free(recs);
 	if (applied != synced)
 		wal_checkpoint(applied);
+	/* Decrement the per-entry pending_count of every op that just drained (and
+	 * advance the drained-seq watermark), so entries whose create/rename has now
+	 * reached the backend become flushable. Cheap when nothing drained. */
+	meta_pending_drain(applied);
 }
 
 /* ---- phase 2: dirty flush ---- */
@@ -546,34 +578,40 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 	/* Claim the entry's current dirty state under the lock (clears its flags) so
 	 * a mutation racing this push isn't lost: it re-dirties the entry and is
 	 * re-flushed next cycle instead of being silently dropped when we'd clear
-	 * the flag post-push. We push the freshly-claimed snapshot. */
+	 * the flag post-push. The claim also re-checks the flush gate atomically and
+	 * registers the path as in-flight. We push the freshly-claimed snapshot. */
 	struct omdfs_entry cur;
 	uint8_t claimed;
 	int c = meta_flush_claim(fuse_dir, e->name, &cur, &claimed);
+	if (c == 2) {
+		/* Gated: a structural op for this entry (or an ancestor) is still
+		 * undrained. Leave it dirty, count the backlog, and re-arm the dir so a
+		 * later (settled) cycle flushes it — the dry path, exactly. */
+		pthread_mutex_lock(&s_stat_mtx);
+		st->dirty_files++;
+		if (e->flags & OMDFS_F_DIRTY_CONTENT)
+			st->dirty_bytes += (long long)e->st.st_size;
+		pthread_mutex_unlock(&s_stat_mtx);
+		dirtyset_add(fuse_dir);
+		return;
+	}
 	if (c != 0)
 		return; /* gone, no longer dirty, or save failed (already re-armed) */
 
 	/* The retry contract.
 	 * --------------------
 	 * This phase-2 flush pushes each dirty entry to its *current* backend path and
-	 * is order-independent and idempotent. A push that fails is NOT an error — it
-	 * means "the backend isn't ready for this entry yet", so we keep the entry dirty
-	 * and try again on a later cycle (the `if (!ok)` block below restores the
-	 * just-claimed flags and re-arms the directory in the dirty-set).
-	 *
-	 * A push can fail even though the local mutation already succeeded, because an
-	 * entry's *existence and location* on the backend is owned by phase 1 (the
-	 * structural WAL: create / mkdir / rename), which drains on its own schedule and
-	 * can lag this flush. In fact the dirty flag is armed *before* the matching WAL
-	 * record is even appended (e.g. omdfs_create/omdfs_mkdir set the flag and call
-	 * dirtyset_add, then wal_append), so a flush can reach an entry whose
-	 * create/mkdir/rename has not reached the backend yet. Its backend path then
-	 * does not exist (or still sits at the pre-rename name), and:
-	 *   - content: copy_file's open of the destination fails, and
-	 *   - attrs:   chmod of the destination fails (ENOENT).
-	 * Either way the path will exist once phase 1 catches up, so we retry rather than
-	 * drop the change — dropping it would lose the write/chmod until a full --resync.
-	 * `ok` tracks "did the push land". */
+	 * is order-independent and idempotent. The flush gate (meta_flushable, re-checked
+	 * in meta_flush_claim) guarantees the entry's create/mkdir/rename — and every
+	 * ancestor's — has already drained to the backend, so the destination path
+	 * exists at the right place: a push failure is no longer the expected
+	 * "structural op hasn't caught up yet" case the old code retried through. A
+	 * failure now means the backend is genuinely unhealthy (down/EIO/ENOSPC). We
+	 * still keep the entry dirty and retry on a later cycle — "dirty until actually
+	 * pushed" is fundamental; clearing the flag on a failed push would lose the
+	 * write until a full --resync. The periodic dirty-set walk drives those retries
+	 * (with its backoff); a genuine I/O failure does not edge-trigger an immediate
+	 * resubmit, so a dead backend isn't hot-looped. `ok` tracks "did the push land". */
 	int ok = 1;
 	if (claimed & OMDFS_F_DIRTY_CONTENT) {
 		char cp[PATH_MAX];
@@ -597,6 +635,9 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 		pthread_mutex_unlock(&s_stat_mtx);
 		dirtyset_add(fuse_dir);
 	}
+	/* Release the in-flight registration taken by the claim, so phase 1 may now
+	 * drain a rename/unlink of this path. */
+	meta_flush_release(fuse_dir, e->name);
 	free(cur.name);
 	free(cur.link);
 }
@@ -630,6 +671,7 @@ struct flush_ctx {
 	int dry;
 	int may_yield;
 	int saturated;
+	int barrier; /* wait for the pool to drain before the cycle returns */
 };
 
 /* Hand one dirty entry to the pool (deep-copying what the worker needs, since the
@@ -644,6 +686,17 @@ static void flush_submit(const char *fuse_dir, const struct omdfs_entry *e,
 			 struct flush_ctx *ctx)
 {
 	if (ctx->dry || ctx->saturated) {
+		flush_entry(fuse_dir, e, ctx->st, 1);
+		return;
+	}
+	/* The flush gate (DESIGN.md Change 2): push an entry only once it and every
+	 * ancestor directory have no undrained structural op, so its backend path
+	 * exists at the right place. A gated entry is dry-counted (re-armed in the
+	 * dirty-set, no backend I/O); the syncer revisits it once the op drains
+	 * (meta_pending_drain kicks a cycle). This replaces the old push-then-retry on
+	 * a not-ready path, and is what makes the flush-before-rename clobber
+	 * impossible. */
+	if (!meta_flushable(fuse_dir, e->name)) {
 		flush_entry(fuse_dir, e, ctx->st, 1);
 		return;
 	}
@@ -769,7 +822,13 @@ static void flush_pending(struct flush_ctx *ctx)
 			dirtyset_add(dirs[i]);
 		dirtyset_free(dirs, n);
 	}
-	pool_drain(); /* dry: nothing was submitted, so this is a no-op */
+	/* Change 3: a normal cycle does NOT barrier on the pool — its phase-2 workers
+	 * may overlap the next cycle's phase 1 (the flushing-path registry keeps that
+	 * safe). Only the first cycle and the unmount drain (barrier set) wait, so the
+	 * unmount loop's progress check sees completed flushes and recovery is
+	 * deterministic. (Dry cycles submit nothing, so this is a no-op there.) */
+	if (ctx->barrier)
+		pool_drain();
 }
 
 /* ---- full resync (operator-triggered reconcile) ---- */
@@ -1197,9 +1256,29 @@ static void sync_once(struct omdfs_status *st, int may_yield)
 	int dry = flush_disabled(); /* state/flush-off: pause phase 2, still count it */
 	st->flush_disabled = dry;
 
-	struct flush_ctx ctx = { .st = st, .dry = dry, .may_yield = may_yield };
-
 	phase_structural(st); /* backend dirs/files exist before content flush */
+
+	/* Recovery guard (DESIGN.md Change 2): entries left dirty by a previous run
+	 * carry no pending_count this run (no foreground append happened), so the
+	 * per-entry flush gate can't see that a recovered rename is still undrained.
+	 * Hold off *real* flushing until the recovered WAL has fully drained once;
+	 * after that every undrained op is a post-mount op with a live count, and the
+	 * gate is complete. Until then run the flush "dry" (count the backlog + keep
+	 * the dirty-set, no backend I/O) so the status stays honest. In the common
+	 * case the recovered WAL drains in this very cycle, so there is no delay. */
+	if (!s_initial_drained && wal_fully_drained())
+		s_initial_drained = 1;
+
+	struct flush_ctx ctx = {
+		.st = st,
+		.dry = dry || !s_initial_drained,
+		.may_yield = may_yield,
+		/* Barrier on the first cycle and every unmount/final-drain cycle (so the
+		 * unmount loop's progress check sees completed flushes); normal cycles
+		 * overlap (Change 3). */
+		.barrier = !may_yield ||
+			   atomic_load_explicit(&s_final_drain, memory_order_relaxed),
+	};
 	flush_pending(&ctx);
 
 	/* Flushed content is now clean and may be reclaimed; this also refreshes

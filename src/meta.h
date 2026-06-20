@@ -28,12 +28,27 @@ enum omdfs_flags {
 	OMDFS_F_FETCHING = 1 << 3,
 };
 
+/* Per-entry exclusion object ("indirection"), reached only via the canonical
+ * entry under meta_mtx. Coordinates the flush against the entry's structural ops
+ * (see DESIGN.md § 2026-06-19). Heap-allocated lazily on the first structural op,
+ * and outlives the entry while pending_count > 0 (the pending-op queue still
+ * references it), so pending_count doubles as the lifetime guard. Internal to
+ * meta.c; declared here only so it can sit on struct omdfs_entry. */
+struct ind {
+	int pending_count; /* this entry's appended-but-undrained structural ops */
+	int detached;	   /* entry removed while count>0; free on count==0 */
+};
+
 struct omdfs_entry {
 	uint8_t type;  /* enum omdfs_type */
 	uint8_t flags; /* enum omdfs_flags */
 	struct stat st;
 	char *name;
 	char *link; /* symlink target, or NULL */
+	/* Non-NULL only on a *canonical* entry (one living in the in-memory index
+	 * cache); always NULL on the deep copies handed to readers / flush workers.
+	 * Owned by meta.c. See struct ind. */
+	struct ind *ind;
 };
 
 struct omdfs_index {
@@ -96,11 +111,24 @@ int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
  * restores the bits via meta_mark_flags(.. set=*cleared ..). Clearing the flag at
  * snapshot time (not after the push) closes the lost-update race where a mutation
  * re-dirties the entry between push and clear and is then dropped. Returns 0 on a
- * successful claim, 1 if the entry is no longer dirty (nothing to do), or -errno
- * (ENOENT if the dir/entry is gone; EIO if the cleared flags couldn't persist —
- * left dirty + re-armed). */
+ * successful claim, 1 if the entry is no longer dirty (nothing to do), 2 if the
+ * flush gate is not yet satisfied (a structural op for the entry or an ancestor is
+ * undrained — still dirty, the caller must re-arm), or -errno (ENOENT if the
+ * dir/entry is gone; EIO if the cleared flags couldn't persist — left dirty +
+ * re-armed). On a successful (0) claim the entry's FUSE path is registered as
+ * in-flight; the caller MUST call meta_flush_release once the push finishes. */
 int meta_flush_claim(const char *fuse_dir, const char *name,
 		     struct omdfs_entry *out, uint8_t *cleared);
+
+/* Release the in-flight registration taken by a successful meta_flush_claim (call
+ * after the backend push completes, success or failure). */
+void meta_flush_release(const char *fuse_dir, const char *name);
+
+/* True if FUSE path `path` is currently being flushed to the backend. Phase 1
+ * consults this before draining a rename/unlink of `path` and defers while it is
+ * set, so a flush's rename(tmp, path) can't race a structural rename/unlink of the
+ * same backend path (DESIGN.md § 2026-06-19, Change 3). */
+int meta_path_flushing(const char *path);
 
 /* Mark every child of `fuse_dir` dirty so the background syncer re-pushes it:
  * OMDFS_F_DIRTY_ATTR on every entry, plus OMDFS_F_DIRTY_CONTENT on regular files
@@ -125,10 +153,48 @@ int meta_add_entry(const char *fuse_dir, const struct omdfs_entry *e);
 int meta_remove_entry(const char *fuse_dir, const char *name);
 
 /* Move child `old_name` from `old_dir` to `new_dir` as `new_name`, carrying its
- * flags (so dirty state survives a rename). Overwrites an existing target.
- * -ENOENT if the source is absent. */
+ * flags AND its per-entry indirection (so dirty state and pending structural-op
+ * counts survive a rename). Overwrites an existing target. -ENOENT if the source
+ * is absent. Does NOT publish the moved entry to the dirty-set: it sets *dst_dirty
+ * (may be NULL) to whether the moved entry is dirty, and the caller publishes
+ * (dirtyset_add(new_dir)) only AFTER appending the rename WAL record and bumping
+ * the count, so the flush never sees the entry dirty-and-settled while its rename
+ * is still undrained (DESIGN.md § 2026-06-19, Change 1). */
 int meta_move_entry(const char *old_dir, const char *old_name,
-		    const char *new_dir, const char *new_name);
+		    const char *new_dir, const char *new_name, int *dst_dirty,
+		    struct ind **moved_ind);
+
+/* Per-entry structural-op accounting (DESIGN.md § 2026-06-19).
+ *
+ * meta_pending_add: record that a structural WAL op with sequence `seq` was just
+ *   appended for child `name` in `dir` — bump that entry's pending_count and queue
+ *   the (seq -> indirection) mapping so the syncer can decrement it when the op
+ *   drains. Called by the mutators right after wal_append. Best-effort: a no-op if
+ *   the entry has already vanished. Returns 0 or -errno (the count is advisory; a
+ *   failure just means the entry won't be gated, never a correctness break).
+ *
+ * meta_pending_drain: the syncer calls this after phase 1 has applied the WAL up to
+ *   `applied_seq` — decrement every queued op with seq <= applied_seq, freeing a
+ *   detached indirection once its last op drains. Kicks the syncer if any live
+ *   entry just reached count 0 (it may now be flushable). */
+int meta_pending_add(const char *dir, const char *name, uint64_t seq);
+void meta_pending_drain(uint64_t applied_seq);
+
+/* Finalize a rename's pending op. meta_move_entry has already bumped the moved
+ * entry's pending_count under the move's lock (so a flush observing the dirty
+ * moved entry also observes count>0 — no publish window), and handed back its
+ * indirection. The caller then appends WAL_RENAME and calls this with the assigned
+ * seq to attach the decrement: if `seq` is 0 (the append failed) or already drained,
+ * the pre-bump is rolled back immediately; otherwise the (seq -> ind) pair is queued
+ * for meta_pending_drain. `in` may be NULL (the move added nothing). */
+void meta_pending_commit(struct ind *in, uint64_t seq);
+
+/* The flush gate: 1 if child `name` in `dir` is safe to push to the backend right
+ * now — the entry AND every ancestor directory have pending_count == 0, so every
+ * structural op its backend path depends on has drained and the path exists at the
+ * right place. 0 if a structural op is still undrained (defer the flush). Cheap:
+ * in-memory walk up the cached parent chain under meta_mtx. (DESIGN.md Change 2.) */
+int meta_flushable(const char *dir, const char *name);
 
 /* Fields selectable by meta_set(). */
 enum meta_field {

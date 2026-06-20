@@ -249,11 +249,14 @@ static int omdfs_create(const char *path, mode_t mode, struct fuse_file_info *fi
 	if (r != 0)
 		return r;
 
+	/* Add the entry CLEAN (no dirty flags), so it is not flush-discoverable until
+	 * we publish it below — after the WAL append and the pending_count bump. That
+	 * ordering means the flush never sees the entry dirty-and-settled while its
+	 * create is still undrained (DESIGN.md § 2026-06-19, Change 1). */
 	struct omdfs_entry e;
 	memset(&e, 0, sizeof(e));
 	e.type = OMDFS_T_FILE;
-	e.flags = OMDFS_F_CONTENT_CACHED | OMDFS_F_DIRTY_CONTENT |
-		  OMDFS_F_DIRTY_ATTR;
+	e.flags = OMDFS_F_CONTENT_CACHED;
 	init_stat(&e.st, S_IFREG | (mode & 07777), 0);
 	e.name = name;
 	r = meta_add_entry(parent, &e);
@@ -264,7 +267,10 @@ static int omdfs_create(const char *path, mode_t mode, struct fuse_file_info *fi
 		unlink(cp);
 		return r;
 	}
-	wal_append(WAL_CREATE, path, NULL);
+	uint64_t seq = wal_append(WAL_CREATE, path, NULL);
+	meta_pending_add(parent, name, seq);
+	/* Publish: arm the dirty flags + record the dir in the dirty-set. */
+	meta_mark_flags(parent, name, OMDFS_F_DIRTY_CONTENT | OMDFS_F_DIRTY_ATTR, 0);
 	syncer_kick();
 	fi->fh = (uint64_t)(uintptr_t)h;
 	return 0;
@@ -283,10 +289,11 @@ static int omdfs_mkdir(const char *path, mode_t mode)
 	if (mkdirs(cp) != 0)
 		return -errno;
 
+	/* Add CLEAN, publish after the append + count bump (see omdfs_create). */
 	struct omdfs_entry e;
 	memset(&e, 0, sizeof(e));
 	e.type = OMDFS_T_DIR;
-	e.flags = OMDFS_F_DIRTY_ATTR;
+	e.flags = 0;
 	init_stat(&e.st, S_IFDIR | (mode & 07777), 0);
 	/* Give the new dir an empty index so it is listable from cache alone. */
 	meta_init_dir(path, &e.st);
@@ -294,7 +301,9 @@ static int omdfs_mkdir(const char *path, mode_t mode)
 	int r = meta_add_entry(parent, &e);
 	if (r != 0)
 		return r;
-	wal_append(WAL_MKDIR, path, NULL);
+	uint64_t seq = wal_append(WAL_MKDIR, path, NULL);
+	meta_pending_add(parent, name, seq);
+	meta_mark_flags(parent, name, OMDFS_F_DIRTY_ATTR, 0); /* publish */
 	syncer_kick();
 	return 0;
 }
@@ -390,12 +399,21 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 		(void)rename(cfrom, cto);
 	}
 
-	int r = meta_move_entry(fp, fn, tp, tn);
+	int dst_dirty = 0;
+	struct ind *moved_ind = NULL;
+	int r = meta_move_entry(fp, fn, tp, tn, &dst_dirty, &moved_ind);
 	if (r != 0)
 		return r;
+	evict_rename(from, to);
+	uint64_t seq = wal_append(WAL_RENAME, from, to);
+	/* Commit the rename's pending_count (pre-bumped under the move's lock) against
+	 * the assigned seq, then publish — so the flush never sees the moved entry
+	 * dirty-and-settled while its rename is still undrained (DESIGN.md Change 1). */
+	meta_pending_commit(moved_ind, seq);
+	if (dst_dirty)
+		dirtyset_add(tp);
 	/* A renamed directory carries its dirty descendants to new paths; re-key
-	 * their dirty-set membership so the syncer still finds them. (meta_move_entry
-	 * already re-flags the destination parent if the moved entry itself is dirty.) */
+	 * their dirty-set membership so the syncer still finds them. */
 	dirtyset_rename(from, to);
 	/* Path-based dirty-set re-keying races with the syncer's own re-arm of stale
 	 * paths (a cycle that took the set, then saturated/failed and re-added the
@@ -406,8 +424,6 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	 * regardless of those races. A file rename can't strand a subtree. */
 	if (!isfile)
 		dirtyset_force_full();
-	evict_rename(from, to);
-	wal_append(WAL_RENAME, from, to);
 	syncer_kick();
 	return 0;
 }
