@@ -157,10 +157,19 @@ static int idx_push(struct omdfs_index *idx, const struct omdfs_entry *e)
 	return 0;
 }
 
+/* Free an indirection iff nothing references it anymore: it is detached from its
+ * entry AND has no undrained structural op (pending_count == 0) AND no in-flight
+ * flush. Called wherever one of those three references drops. meta_mtx held. */
+static void ind_maybe_free(struct ind *in)
+{
+	if (in && in->detached && in->pending_count == 0 && !in->flushing)
+		free(in);
+}
+
 /* Release a canonical entry's indirection as the entry goes away (removed, or its
- * whole index freed). If structural ops are still pending against it, the
- * pending-op queue still references it: detach (the next decrement to 0 frees it).
- * Otherwise free it now. NULL-safe and a no-op on reader copies (ind == NULL).
+ * whole index freed). The entry reference is gone (detach); the indirection lives
+ * on while the pending-op queue or an in-flight flush still references it, and is
+ * freed once neither does. NULL-safe and a no-op on reader copies (ind == NULL).
  * meta_mtx held for any entry that actually carries an ind. */
 static void ind_release(struct omdfs_entry *e)
 {
@@ -168,10 +177,8 @@ static void ind_release(struct omdfs_entry *e)
 	if (!in)
 		return;
 	e->ind = NULL;
-	if (in->pending_count > 0)
-		in->detached = 1; /* queue owns it now; freed when it drains to 0 */
-	else
-		free(in);
+	in->detached = 1;
+	ind_maybe_free(in);
 }
 
 /* Ensure `e` has an indirection, allocating it lazily. Returns it, or NULL on OOM.
@@ -1177,14 +1184,14 @@ int meta_mark_flags(const char *fuse_dir, const char *name, uint8_t set_bits,
 	return r;
 }
 
-/* Defined below (with the rest of the flush-gate / in-flight-registry helpers),
- * but used here by meta_flush_claim. */
+/* Defined below (with the flush gate), but used here by meta_flush_claim. */
 static int flushable_locked(const char *dir, const char *name);
-static void flushing_add_locked(const char *path);
 
 int meta_flush_claim(const char *fuse_dir, const char *name,
-		     struct omdfs_entry *out, uint8_t *cleared)
+		     struct omdfs_entry *out, uint8_t *cleared,
+		     struct ind **out_ind)
 {
+	*out_ind = NULL;
 	pthread_mutex_lock(&meta_mtx);
 	int r;
 	struct omdfs_index *idx = cache_canonical(fuse_dir, &r);
@@ -1239,15 +1246,16 @@ int meta_flush_claim(const char *fuse_dir, const char *name,
 		return -EIO;
 	}
 	*cleared = d;
-	/* Register the path we are about to push so the next cycle's phase 1 defers a
-	 * concurrent rename/unlink of it (Change 3). Atomic with the claim under
-	 * meta_mtx. The caller pairs this with meta_flush_release after the push. */
-	char fpath[PATH_MAX];
-	if (fuse_dir[0] == '/' && fuse_dir[1] == '\0')
-		snprintf(fpath, sizeof(fpath), "/%s", name);
-	else
-		snprintf(fpath, sizeof(fpath), "%s/%s", fuse_dir, name);
-	flushing_add_locked(fpath);
+	/* Mark the entry's indirection in-flight so the next cycle's phase 1 defers a
+	 * concurrent rename/unlink of it (Change 3), and hand the indirection back so
+	 * the caller can release it after the push — reached by pointer, so it survives
+	 * the entry being renamed or unlinked mid-flush. flushing also anchors the
+	 * indirection's lifetime. Atomic with the claim under meta_mtx. ind_ensure can
+	 * only fail on OOM, in which case we skip the exclusion (degrades safely). */
+	struct ind *in = ind_ensure(e);
+	if (in)
+		in->flushing = 1;
+	*out_ind = in;
 	pthread_mutex_unlock(&meta_mtx);
 	return 0;
 }
@@ -1378,8 +1386,11 @@ static void drop_at(struct omdfs_index *idx, size_t i, int release_ind)
 	idx_hash_drop(idx); /* slot moved: invalidate the lookup hash */
 }
 
-int meta_remove_entry(const char *fuse_dir, const char *name)
+int meta_remove_entry(const char *fuse_dir, const char *name,
+		      struct ind **out_ind)
 {
+	if (out_ind)
+		*out_ind = NULL;
 	pthread_mutex_lock(&meta_mtx);
 	int r;
 	struct omdfs_index *idx = cache_canonical(fuse_dir, &r);
@@ -1392,12 +1403,33 @@ int meta_remove_entry(const char *fuse_dir, const char *name)
 		pthread_mutex_unlock(&meta_mtx);
 		return -ENOENT;
 	}
-	drop_at(idx, (size_t)(e - idx->entries), 1 /* real removal: release ind */);
+	/* Keep the entry's indirection (transfer it to the caller, not release it), so a
+	 * concurrent flush's flushing flag stays reachable until both the flush and the
+	 * upcoming unlink/rmdir op finish. Detach the entry from the visible index now. */
+	struct ind *in = ind_ensure(e); /* NULL only on OOM */
+	drop_at(idx, (size_t)(e - idx->entries), 0 /* ind transferred, don't release */);
 	r = meta_schedule_save(cnode_of(idx));
-	if (r != 0)
+	if (r != 0) {
 		cache_drop(fuse_dir);
+		/* The removal didn't persist; the orphaned indirection has no entry — mark
+		 * it detached and free it unless a flush still holds it. */
+		if (in) {
+			in->detached = 1;
+			ind_maybe_free(in);
+		}
+		pthread_mutex_unlock(&meta_mtx);
+		return r;
+	}
+	/* Pre-bump for the unlink/rmdir node the caller is about to append (committed,
+	 * or rolled back, by meta_pending_attach), and mark detached (no entry). */
+	if (in) {
+		in->pending_count++;
+		in->detached = 1;
+	}
 	pthread_mutex_unlock(&meta_mtx);
-	return r;
+	if (out_ind)
+		*out_ind = in;
+	return 0;
 }
 
 int meta_move_entry(const char *old_dir, const char *old_name,
@@ -1592,126 +1624,183 @@ int meta_set(const char *fuse_dir, const char *name, const struct stat *src,
 	return r;
 }
 
-/* ---- per-entry structural-op accounting (the pending-op queue) ----
+/* ---- in-memory structural WAL (DESIGN.md § 2026-06-20) ----
  *
- * Each create/mkdir/rename bumps the affected entry's pending_count right after its
- * WAL record is appended, and records (seq -> indirection) here. The syncer
- * decrements via meta_pending_drain once phase 1 has applied that seq — using the
- * queued indirection pointer, never the WAL record's path (which is stale after a
- * rename). The on-disk WAL stays the recovery log; the syncer holds off real
- * flushing until the recovered WAL has fully drained once (see the syncer's
- * s_initial_drained), so recovered ops need no counts and every count here covers a
- * post-mount op. All state under meta_mtx. */
+ * A seq-ordered FIFO of the structural ops phase 1 still has to apply. Every op
+ * pushes one node and bumps the affected entry's pending_count (so the count IS the
+ * number of undrained nodes referencing that indirection); each node also carries a
+ * direct handle to that indirection, so the flush exclusion is a node->ind->flushing
+ * read with no path lookup. The foreground only appends at the tail; the syncer only
+ * pops the head — so the head is stable for the syncer between peek and pop. The
+ * on-disk WAL stays the durability/recovery log: it is read once at mount to seed
+ * this queue, and otherwise only appended + checkpoint-truncated.
+ *
+ * Tail-append keeps the queue in seq order without sorting: dependent ops are
+ * causally ordered by the foreground (an app's syscall returns only after its
+ * handler — including the push — completes, before it issues the next), so they push
+ * in seq order; independent concurrent ops may interleave, but their relative order
+ * is irrelevant. All state under meta_mtx. */
 struct pending_op {
 	uint64_t seq;
-	struct ind *ind;
+	uint8_t op;	  /* enum wal_op */
+	char *path;	  /* op's primary path (owned) */
+	char *path2;	  /* rename/symlink secondary, or NULL (owned) */
+	struct ind *ind;  /* affected entry's indirection; NULL for seeded recovery ops */
 	struct pending_op *next;
 };
-static struct pending_op *pq_head;
-/* Highest WAL seq the syncer has reported drained. A structural op can race: phase 1
- * applies + drains seq S before the foreground that appended S gets here to record
- * its count. The watermark makes meta_pending_add a no-op for an already-drained seq,
- * so the count never leaks (it would otherwise stay >0 forever, the op being already
- * past drain). Both sides act under meta_mtx, so the check-and-act is atomic. */
-static uint64_t g_drained_seq;
+static struct pending_op *pq_head, *pq_tail;
+static long pq_len;
 
-int meta_pending_add(const char *dir, const char *name, uint64_t seq)
+/* meta_mtx held. Append a fully-built node at the tail. */
+static void pq_append(struct pending_op *p)
 {
-	if (seq == 0)
-		return 0; /* the wal_append failed; nothing to account */
-	pthread_mutex_lock(&meta_mtx);
-	if (seq <= g_drained_seq) {
-		/* Phase 1 already drained this op (it raced ahead of us): there is
-		 * nothing pending, so don't bump — a bump now would never be matched
-		 * by a decrement and would strand the count. */
-		pthread_mutex_unlock(&meta_mtx);
-		return 0;
-	}
-	struct cnode *n = cache_find(dir);
-	struct omdfs_entry *e = n ? meta_lookup(&n->idx, name) : NULL;
-	if (!e) {
-		/* The entry vanished between the append and here (a racing op). The
-		 * WAL op still drains, but there is no live entry to gate. Skip: drain
-		 * pops only queued seqs, so the queue stays consistent. */
-		pthread_mutex_unlock(&meta_mtx);
-		return 0;
-	}
+	p->next = NULL;
+	if (pq_tail)
+		pq_tail->next = p;
+	else
+		pq_head = p;
+	pq_tail = p;
+	pq_len++;
+}
+
+/* meta_mtx held. Build + tail-append a node; returns 0 or -1 on OOM (nothing
+ * appended). `in` may be NULL (a recovered/entry-less op that still must drain). */
+static int pq_emit(uint64_t seq, uint8_t op, const char *path, const char *path2,
+		   struct ind *in)
+{
 	struct pending_op *p = malloc(sizeof(*p));
-	if (!p) {
-		pthread_mutex_unlock(&meta_mtx);
-		return -ENOMEM;
+	char *pp = strdup(path);
+	char *pp2 = path2 ? strdup(path2) : NULL;
+	if (!p || !pp || (path2 && !pp2)) {
+		free(p);
+		free(pp);
+		free(pp2);
+		return -1;
 	}
-	if (!e->ind) {
-		e->ind = calloc(1, sizeof(*e->ind));
-		if (!e->ind) {
-			free(p);
-			pthread_mutex_unlock(&meta_mtx);
-			return -ENOMEM;
-		}
-	}
-	e->ind->pending_count++;
 	p->seq = seq;
-	p->ind = e->ind;
-	p->next = pq_head;
-	pq_head = p; /* unordered; drain scans for seq <= applied */
-	pthread_mutex_unlock(&meta_mtx);
+	p->op = op;
+	p->path = pp;
+	p->path2 = pp2;
+	p->ind = in;
+	pq_append(p);
 	return 0;
 }
 
-void meta_pending_drain(uint64_t applied_seq)
-{
-	int woke = 0;
-	pthread_mutex_lock(&meta_mtx);
-	if (applied_seq > g_drained_seq)
-		g_drained_seq = applied_seq;
-	struct pending_op **pp = &pq_head;
-	while (*pp) {
-		struct pending_op *p = *pp;
-		if (p->seq > applied_seq) {
-			pp = &p->next;
-			continue;
-		}
-		*pp = p->next; /* unlink this drained op */
-		struct ind *in = p->ind;
-		free(p);
-		if (in->pending_count > 0)
-			in->pending_count--;
-		if (in->pending_count == 0) {
-			if (in->detached)
-				free(in); /* entry gone; this was its last op */
-			else
-				woke = 1; /* a live entry just became flushable */
-		}
-	}
-	pthread_mutex_unlock(&meta_mtx);
-	if (woke)
-		syncer_kick(); /* run a cycle to flush the newly-settled entries */
-}
-
-void meta_pending_commit(struct ind *in, uint64_t seq)
+/* Roll back a pre-bump (meta_mtx held): the op never made it into the queue, so the
+ * entry's count must not strand. */
+static void ind_unbump(struct ind *in)
 {
 	if (!in)
-		return; /* the move bumped nothing (OOM, or no move) */
+		return;
+	if (in->pending_count > 0)
+		in->pending_count--;
+	ind_maybe_free(in);
+}
+
+uint64_t meta_pending_seed(void)
+{
+	struct wal_record *recs = NULL;
+	size_t n = 0;
+	uint64_t synced = wal_synced_seq();
+	if (wal_load_pending(synced, &recs, &n) != 0)
+		return 0;
+	uint64_t maxseq = 0;
 	pthread_mutex_lock(&meta_mtx);
-	/* seq == 0: the wal_append failed, so no record will ever drain this bump.
-	 * seq <= g_drained_seq: phase 1 already applied + drained the rename between
-	 * the append and here, so there is nothing left pending. Either way, roll the
-	 * pre-bump back. Otherwise queue the (seq -> ind) decrement. */
-	int rollback = (seq == 0 || seq <= g_drained_seq);
-	struct pending_op *p = rollback ? NULL : malloc(sizeof(*p));
-	if (rollback || !p) {
-		if (in->pending_count > 0)
-			in->pending_count--;
-		if (in->pending_count == 0 && in->detached)
-			free(in);
+	for (size_t i = 0; i < n; i++) {
+		const char *p2 = recs[i].path2[0] ? recs[i].path2 : NULL;
+		/* ind == NULL: the entries aren't loaded yet, and no flush can be in
+		 * flight on a just-mounted system; recovered ops drain purely by path. */
+		if (pq_emit(recs[i].seq, recs[i].op, recs[i].path, p2, NULL) == 0 &&
+		    recs[i].seq > maxseq)
+			maxseq = recs[i].seq;
+	}
+	pthread_mutex_unlock(&meta_mtx);
+	free(recs);
+	return maxseq;
+}
+
+void meta_pending_push(uint8_t op, const char *path, const char *path2,
+		       const char *dir, const char *name, uint64_t seq)
+{
+	if (seq == 0)
+		return; /* the wal_append failed; the op simply won't sync this mount */
+	pthread_mutex_lock(&meta_mtx);
+	struct cnode *n = cache_find(dir);
+	struct omdfs_entry *e = n ? meta_lookup(&n->idx, name) : NULL;
+	struct ind *in = e ? ind_ensure(e) : NULL; /* NULL: entry vanished or OOM */
+	if (in)
+		in->pending_count++;
+	if (pq_emit(seq, op, path, path2, in) != 0)
+		ind_unbump(in); /* OOM: undo the bump; op waits for the next mount */
+	pthread_mutex_unlock(&meta_mtx);
+}
+
+void meta_pending_attach(struct ind *in, uint64_t seq, uint8_t op,
+			 const char *path, const char *path2)
+{
+	pthread_mutex_lock(&meta_mtx);
+	if (seq == 0) {
+		ind_unbump(in); /* the append failed: roll the pre-bump back */
 		pthread_mutex_unlock(&meta_mtx);
 		return;
 	}
-	p->seq = seq;
-	p->ind = in;
-	p->next = pq_head;
-	pq_head = p;
+	if (pq_emit(seq, op, path, path2, in) != 0)
+		ind_unbump(in); /* OOM */
 	pthread_mutex_unlock(&meta_mtx);
+}
+
+int meta_pending_peek(struct pending_view *out)
+{
+	pthread_mutex_lock(&meta_mtx);
+	struct pending_op *p = pq_head;
+	if (!p) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
+	out->seq = p->seq;
+	out->op = p->op;
+	snprintf(out->path, sizeof(out->path), "%s", p->path);
+	snprintf(out->path2, sizeof(out->path2), "%s", p->path2 ? p->path2 : "");
+	out->is_flushing = (p->ind && p->ind->flushing) ? 1 : 0;
+	pthread_mutex_unlock(&meta_mtx);
+	return 1;
+}
+
+void meta_pending_pop(uint64_t seq)
+{
+	pthread_mutex_lock(&meta_mtx);
+	struct pending_op *p = pq_head;
+	if (!p || p->seq != seq) {
+		/* Only the syncer pops and the foreground only appends, so the head is
+		 * always the seq we peeked; the guard is purely defensive. */
+		pthread_mutex_unlock(&meta_mtx);
+		return;
+	}
+	pq_head = p->next;
+	if (!pq_head)
+		pq_tail = NULL;
+	pq_len--;
+	struct ind *in = p->ind;
+	free(p->path);
+	free(p->path2);
+	free(p);
+	if (in) {
+		if (in->pending_count > 0)
+			in->pending_count--;
+		ind_maybe_free(in);
+	}
+	/* No kick: phase 2 runs after phase 1 in this same cycle, so a just-settled
+	 * entry (its dir already in the dirty-set from when it was gated) is flushed
+	 * this cycle without an extra wakeup. */
+	pthread_mutex_unlock(&meta_mtx);
+}
+
+long meta_pending_count(void)
+{
+	pthread_mutex_lock(&meta_mtx);
+	long c = pq_len;
+	pthread_mutex_unlock(&meta_mtx);
+	return c;
 }
 
 /* The flush gate, meta_mtx held. 1 if child `name` in `dir` and every ancestor
@@ -1750,78 +1839,13 @@ int meta_flushable(const char *dir, const char *name)
 	return ok;
 }
 
-/* ---- in-flight flush registry (Change 3: barrier-free phase exclusion) ----
- *
- * With the per-cycle pool_drain gone, a phase-2 flush worker can be copying to a
- * backend path P while the next cycle's phase 1 wants to rename/unlink P. If phase
- * 1 won, the worker's later rename(tmp, P) would resurrect a just-removed/moved
- * file. Each worker registers the FUSE path it is flushing here (atomically with
- * its claim, under meta_mtx); phase 1 checks the path before draining a rename or
- * unlink of it and defers while it is registered. The set is keyed by path (not by
- * the entry's indirection) so it survives the entry being unlinked mid-flush. */
-#define FLUSHING_BUCKETS 256
-struct fnode {
-	char *path;
-	struct fnode *next;
-};
-static struct fnode *flushing_set[FLUSHING_BUCKETS];
-
-/* meta_mtx held. */
-static void flushing_add_locked(const char *path)
+void meta_flush_release(struct ind *in)
 {
-	size_t b = cache_hash(path); /* hashes into META_CACHE_BUCKETS; mask down */
-	b &= (FLUSHING_BUCKETS - 1);
-	struct fnode *f = malloc(sizeof(*f));
-	if (!f)
-		return; /* best-effort: on OOM we skip exclusion (rare; degrades safely) */
-	f->path = strdup(path);
-	if (!f->path) {
-		free(f);
+	if (!in)
 		return;
-	}
-	f->next = flushing_set[b];
-	flushing_set[b] = f;
-}
-
-/* meta_mtx held. Remove one node matching `path` (duplicates may exist if the same
- * path is flushed across two overlapping cycles; each begin pairs with one end). */
-static void flushing_del_locked(const char *path)
-{
-	size_t b = cache_hash(path) & (FLUSHING_BUCKETS - 1);
-	for (struct fnode **pp = &flushing_set[b]; *pp; pp = &(*pp)->next) {
-		if (!strcmp((*pp)->path, path)) {
-			struct fnode *f = *pp;
-			*pp = f->next;
-			free(f->path);
-			free(f);
-			return;
-		}
-	}
-}
-
-int meta_path_flushing(const char *path)
-{
 	pthread_mutex_lock(&meta_mtx);
-	size_t b = cache_hash(path) & (FLUSHING_BUCKETS - 1);
-	int found = 0;
-	for (struct fnode *f = flushing_set[b]; f; f = f->next)
-		if (!strcmp(f->path, path)) {
-			found = 1;
-			break;
-		}
-	pthread_mutex_unlock(&meta_mtx);
-	return found;
-}
-
-void meta_flush_release(const char *dir, const char *name)
-{
-	char fpath[PATH_MAX];
-	if (dir[0] == '/' && dir[1] == '\0')
-		snprintf(fpath, sizeof(fpath), "/%s", name);
-	else
-		snprintf(fpath, sizeof(fpath), "%s/%s", dir, name);
-	pthread_mutex_lock(&meta_mtx);
-	flushing_del_locked(fpath);
+	in->flushing = 0;
+	ind_maybe_free(in); /* the flush was the last reference? then free it */
 	pthread_mutex_unlock(&meta_mtx);
 }
 

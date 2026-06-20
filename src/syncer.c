@@ -105,10 +105,13 @@ static pthread_t s_thread;
 static int s_stop, s_kick, s_running;
 static long long s_last_clean; /* epoch of the last fully-drained cycle */
 /* Set once the recovered structural WAL has fully drained. Until then the dirty
- * flush runs dry — recovered-dirty entries have no pending_count to gate them, so
- * we must not push one whose recovered rename is still undrained (DESIGN Change 2,
- * the recovery guard). Touched only on the syncer thread. */
+ * flush runs dry — recovered-dirty entries have no pending_count to gate them (the
+ * seeded queue nodes carry ind == NULL), so we must not push one whose recovered
+ * rename is still undrained (the recovery guard). s_recovery_max is the highest seq
+ * seeded from the on-disk WAL at startup; recovery is done once the checkpoint has
+ * caught up to it. Touched only on the syncer thread. */
 static int s_initial_drained;
+static uint64_t s_recovery_max;
 
 /* Guards the shared status/resync stat counters updated from pool workers. */
 static pthread_mutex_t s_stat_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -436,31 +439,16 @@ static int is_permanent(int err)
 	}
 }
 
-/* apply_structural's "not an error, just retry next pass" signal: a rename/unlink
- * is deferred because a phase-2 flush is in flight on the same backend path (Change
- * 3). Distinct from a real errno (all positive) and from 0 (applied). */
-#define SYNC_DEFER (-1)
-
-/* Apply one structural record to the backend. Returns 0 if applied (or
- * idempotently a no-op), SYNC_DEFER to retry next pass without blame (a flush holds
- * the path), else the positive errno to retry on (blocks later ops). */
-static int apply_structural(const struct wal_record *r)
+/* Apply one structural op to the backend by its stored path(s). Returns 0 if applied
+ * (or idempotently a no-op), else the positive errno to retry on (blocks later ops).
+ * The flush exclusion (deferring a rename/unlink of a path being flushed) is checked
+ * by the caller via the peek's is_flushing, so it isn't repeated here. */
+static int apply_structural(uint8_t op, const char *path, const char *path2)
 {
 	char bp[PATH_MAX], bp2[PATH_MAX];
-	backend_path(bp, r->path);
+	backend_path(bp, path);
 
-	/* Defer a rename/unlink while a flush is copying to the same backend path: the
-	 * flush's rename(tmp, path) and this structural op must not interleave (a lost
-	 * barrier would let the structural op resurrect a flushed file, or the flush
-	 * recreate a removed one). create/mkdir/rmdir/symlink can't collide with an
-	 * in-flight content push (the gate held the flush until the path existed; an
-	 * rmdir target is empty), so only these two are checked. */
-	if ((r->op == WAL_UNLINK && meta_path_flushing(r->path)) ||
-	    (r->op == WAL_RENAME &&
-	     (meta_path_flushing(r->path) || meta_path_flushing(r->path2))))
-		return SYNC_DEFER;
-
-	switch (r->op) {
+	switch (op) {
 	case WAL_CREATE: {
 		/* O_EXCL so we never reopen an existing file: the create's
 		 * intent is just "the file exists", and an existing target
@@ -486,12 +474,12 @@ static int apply_structural(const struct wal_record *r)
 			return errno;
 		return 0;
 	case WAL_RENAME:
-		backend_path(bp2, r->path2);
+		backend_path(bp2, path2 ? path2 : "");
 		if (rename(bp, bp2) != 0 && errno != ENOENT)
 			return errno;
 		return 0;
 	case WAL_SYMLINK:
-		if (symlink(r->path2, bp) != 0 && errno != EEXIST)
+		if (symlink(path2 ? path2 : "", bp) != 0 && errno != EEXIST)
 			return errno;
 		return 0;
 	}
@@ -501,43 +489,33 @@ static int apply_structural(const struct wal_record *r)
 static void phase_structural(struct omdfs_status *st)
 {
 	uint64_t synced = wal_synced_seq();
-	struct wal_record *recs = NULL;
-	size_t n = 0;
-	if (wal_load_pending(synced, &recs, &n) != 0)
-		return;
-
 	uint64_t applied = synced;
-	size_t done = 0;
-	for (size_t i = 0; i < n; i++) {
-		int err = apply_structural(&recs[i]);
-		if (err == 0) {
-			applied = recs[i].seq;
-			done++;
-			continue;
-		}
-		if (err == SYNC_DEFER) {
-			/* A flush holds this path; stop here (strict in-order) and retry
-			 * next cycle — NOT a stuck failure. The flush completing kicks the
-			 * syncer, so the retry is prompt. */
+	for (;;) {
+		struct pending_view v;
+		if (!meta_pending_peek(&v))
+			break; /* in-memory queue empty: nothing to drain */
+		/* Flush exclusion (Change 3): a rename/unlink of a path a flush is
+		 * copying to must wait for that flush to finish. Stop here (strict
+		 * in-order); the flush's release lets a later cycle proceed. */
+		if ((v.op == WAL_RENAME || v.op == WAL_UNLINK) && v.is_flushing)
 			break;
+		const char *p2 = v.path2[0] ? v.path2 : NULL;
+		int err = apply_structural(v.op, v.path, p2);
+		if (err == 0) {
+			meta_pending_pop(v.seq); /* pops the head + decrements its ind */
+			applied = v.seq;
+			continue;
 		}
 		/* Strict in-order: the head op is blocked; surface it and stop. */
 		st->stuck_errno = err;
 		st->stuck = is_permanent(err);
-		snprintf(st->stuck_op, sizeof(st->stuck_op), "%s",
-			 op_name(recs[i].op));
-		snprintf(st->stuck_path, sizeof(st->stuck_path), "%s",
-			 recs[i].path);
+		snprintf(st->stuck_op, sizeof(st->stuck_op), "%s", op_name(v.op));
+		snprintf(st->stuck_path, sizeof(st->stuck_path), "%s", v.path);
 		break;
 	}
-	st->pending_structural += (long)(n - done);
-	free(recs);
 	if (applied != synced)
 		wal_checkpoint(applied);
-	/* Decrement the per-entry pending_count of every op that just drained (and
-	 * advance the drained-seq watermark), so entries whose create/rename has now
-	 * reached the backend become flushable. Cheap when nothing drained. */
-	meta_pending_drain(applied);
+	st->pending_structural += meta_pending_count();
 }
 
 /* ---- phase 2: dirty flush ---- */
@@ -582,7 +560,8 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 	 * registers the path as in-flight. We push the freshly-claimed snapshot. */
 	struct omdfs_entry cur;
 	uint8_t claimed;
-	int c = meta_flush_claim(fuse_dir, e->name, &cur, &claimed);
+	struct ind *fin = NULL;
+	int c = meta_flush_claim(fuse_dir, e->name, &cur, &claimed, &fin);
 	if (c == 2) {
 		/* Gated: a structural op for this entry (or an ancestor) is still
 		 * undrained. Leave it dirty, count the backlog, and re-arm the dir so a
@@ -635,9 +614,9 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 		pthread_mutex_unlock(&s_stat_mtx);
 		dirtyset_add(fuse_dir);
 	}
-	/* Release the in-flight registration taken by the claim, so phase 1 may now
-	 * drain a rename/unlink of this path. */
-	meta_flush_release(fuse_dir, e->name);
+	/* Release the in-flight flag taken by the claim, so phase 1 may now drain a
+	 * rename/unlink of this entry. */
+	meta_flush_release(fin);
 	free(cur.name);
 	free(cur.link);
 }
@@ -1003,6 +982,7 @@ int syncer_resync(void)
 {
 	struct omdfs_status st;
 	struct resync_stats rs;
+	meta_pending_seed(); /* offline: load any on-disk pending ops to drain by path */
 	pool_start(); /* offline: no syncer thread has started one yet */
 	resync_reconcile(&rs, &st);
 	pool_stop();
@@ -1266,7 +1246,7 @@ static void sync_once(struct omdfs_status *st, int may_yield)
 	 * gate is complete. Until then run the flush "dry" (count the backlog + keep
 	 * the dirty-set, no backend I/O) so the status stays honest. In the common
 	 * case the recovered WAL drains in this very cycle, so there is no delay. */
-	if (!s_initial_drained && wal_fully_drained())
+	if (!s_initial_drained && wal_synced_seq() >= s_recovery_max)
 		s_initial_drained = 1;
 
 	struct flush_ctx ctx = {
@@ -1380,6 +1360,10 @@ int syncer_start(void)
 		if (*end == '\0' && v >= 0)
 			s_backoff_ms = v; /* 0 = disable backoff */
 	}
+	/* Seed the in-memory structural WAL from any ops a previous run left on disk
+	 * (recovery), before the drain thread starts. s_recovery_max gates real flushing
+	 * until those drain. */
+	s_recovery_max = meta_pending_seed();
 	pool_start(); /* parallel copy workers, used from the first cycle on */
 	if (pthread_create(&s_thread, NULL, syncer_loop, NULL) != 0) {
 		pool_stop();
