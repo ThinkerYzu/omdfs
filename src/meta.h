@@ -29,6 +29,9 @@ enum omdfs_flags {
 	OMDFS_F_FETCHING = 1 << 3,
 };
 
+struct omdfs_entry;
+struct cnode;
+
 /* Per-entry exclusion object ("indirection"), reached only via the canonical
  * entry under meta_mtx. Coordinates the flush against the entry's structural ops
  * (see DESIGN.md § 2026-06-19). Heap-allocated lazily on the first structural op,
@@ -39,6 +42,14 @@ struct ind {
 	int pending_count; /* this entry's appended-but-undrained structural ops */
 	int flushing;	   /* a flush of this entry is in progress (Change 3) */
 	int detached;	   /* entry detached from the index; free when no longer referenced */
+	/* Live-entry handle (DESIGN.md § 2026-06-20, positional-index section): the
+	 * entry this indirection belongs to and its owning directory node, kept current
+	 * by the meta layer across every entry relocation (idx_push realloc, drop_at
+	 * swap, cross-dir move); both NULL once the entry is detached. Currently read
+	 * only by the NDEBUG-gated handle audit — deliberate foundation for a future
+	 * "reach the live entry from a drain node" reader, not yet wired. */
+	struct omdfs_entry *entry;
+	struct cnode *cnode;
 };
 
 struct omdfs_entry {
@@ -153,9 +164,9 @@ int meta_add_entry(const char *fuse_dir, const struct omdfs_entry *e);
  * indirection stays reachable until both any in-flight flush and the upcoming
  * unlink/rmdir op finish, KEEPS the indirection alive and hands it back in
  * *out_ind with pending_count pre-bumped for the op the caller is about to append.
- * The caller MUST then call meta_pending_attach(*out_ind, seq, op, path, NULL) to
- * link the op's drain node (or, on a failed append, to roll the pre-bump back).
- * *out_ind may come back NULL if the entry had no indirection to anchor. */
+ * The caller MUST then call syncer_log_attach(*out_ind, op, path, NULL) to enqueue
+ * the op's drain node (or, on a failed append, to roll the pre-bump back via
+ * meta_ind_unbump). *out_ind may come back NULL if the entry had no indirection. */
 int meta_remove_entry(const char *fuse_dir, const char *name,
 		      struct ind **out_ind);
 
@@ -171,53 +182,27 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 		    const char *new_dir, const char *new_name, int *dst_dirty,
 		    struct ind **moved_ind);
 
-/* ---- in-memory structural WAL (DESIGN.md § 2026-06-20) ----
+/* ---- indirection lifecycle for the syncer's structural drain queue ----
  *
- * Phase 1 drains an in-memory FIFO of structural ops instead of re-reading the
- * on-disk WAL each cycle. Each node is {seq, op, path, path2, ind}, kept in seq
- * order; every structural op pushes one node and bumps the affected entry's
- * pending_count (so the count IS the number of undrained nodes referencing that
- * indirection). Each node also carries a direct handle to the entry's indirection,
- * so the flush exclusion is a `node->ind->flushing` read with no path lookup.
+ * The structural drain FIFO lives in syncer.c (its node is {wal_record*, ind});
+ * meta.c only owns the per-entry `ind` and exposes the four operations the syncer
+ * needs on it, each taking meta_mtx internally (DESIGN.md § 2026-06-21).
  *
- * meta_pending_seed: at startup, build the queue from the on-disk pending WAL as
- *   ind == NULL nodes (recovered ops drain by path; no live entry/flush yet).
- *   Returns the highest seq seeded (0 if none) so the caller can tell when recovery
- *   has fully drained.
- * meta_pending_push: for create/mkdir/symlink — resolve child (dir,name), ensure
- *   its indirection, bump the count, and append the drain node. A no-op when seq==0
- *   (the append failed) or the entry vanished. Best-effort (OOM => the op simply
- *   waits for the next mount; never data loss).
- * meta_pending_attach: for rename/unlink/rmdir — the indirection was already
- *   pre-bumped and handed back by meta_move_entry / meta_remove_entry. Link its
- *   drain node for `seq`; if seq==0 (the append failed) roll the pre-bump back.
- *   `in` may be NULL (nothing to do). */
-uint64_t meta_pending_seed(void);
-void meta_pending_push(uint8_t op, const char *path, const char *path2,
-		       const char *dir, const char *name, uint64_t seq);
-void meta_pending_attach(struct ind *in, uint64_t seq, uint8_t op,
-			 const char *path, const char *path2);
-
-/* The head op the syncer should drain next, copied out under meta_mtx. `is_flushing`
- * is set when the op is a rename/unlink whose entry has a flush in progress (defer
- * it). Returns 1 if a node was copied, 0 if the queue is empty. */
-struct pending_view {
-	uint64_t seq;
-	uint8_t op;
-	char path[PATH_MAX];
-	char path2[PATH_MAX];
-	int is_flushing;
-};
-int meta_pending_peek(struct pending_view *out);
-
-/* Pop the head node iff it still has sequence `seq` (it always does — only the
- * syncer pops, the foreground only appends at the tail), decrementing its
- * indirection's count and freeing the indirection if nothing references it. Call
- * after meta_pending_peek + a successful backend apply. */
-void meta_pending_pop(uint64_t seq);
-
-/* Number of undrained nodes still in the queue (for the status backlog). */
-long meta_pending_count(void);
+ * meta_ind_acquire: for create/mkdir/symlink — resolve child (dir,name), ensure its
+ *   indirection, bump pending_count, and return it (the syncer enqueues a node
+ *   holding it). NULL if the entry vanished or OOM. (rename/unlink/rmdir don't use
+ *   this — their ind is pre-bumped and handed back by meta_move_entry /
+ *   meta_remove_entry.)
+ * meta_ind_unbump: roll one pending_count bump back (a failed append or enqueue);
+ *   frees the indirection if nothing else references it. NULL-safe.
+ * meta_ind_flushing: 1 if `in` has a flush in progress (the drain defers a
+ *   rename/unlink whose path a flush is copying). Runs the handle audit. NULL => 0.
+ * meta_ind_settle: the op drained — drop pending_count and free the indirection if
+ *   nothing else references it. Runs the handle audit. NULL-safe. */
+struct ind *meta_ind_acquire(const char *dir, const char *name);
+void meta_ind_unbump(struct ind *in);
+int meta_ind_flushing(struct ind *in);
+void meta_ind_settle(struct ind *in);
 
 /* The flush gate: 1 if child `name` in `dir` is safe to push to the backend right
  * now — the entry AND every ancestor directory have pending_count == 0, so every

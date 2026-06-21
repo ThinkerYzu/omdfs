@@ -267,8 +267,7 @@ static int omdfs_create(const char *path, mode_t mode, struct fuse_file_info *fi
 		unlink(cp);
 		return r;
 	}
-	uint64_t seq = wal_append(WAL_CREATE, path, NULL);
-	meta_pending_push(WAL_CREATE, path, NULL, parent, name, seq);
+	syncer_log_push(WAL_CREATE, path, NULL, parent, name);
 	/* Publish: arm the dirty flags + record the dir in the dirty-set. */
 	meta_mark_flags(parent, name, OMDFS_F_DIRTY_CONTENT | OMDFS_F_DIRTY_ATTR, 0);
 	syncer_kick();
@@ -301,8 +300,7 @@ static int omdfs_mkdir(const char *path, mode_t mode)
 	int r = meta_add_entry(parent, &e);
 	if (r != 0)
 		return r;
-	uint64_t seq = wal_append(WAL_MKDIR, path, NULL);
-	meta_pending_push(WAL_MKDIR, path, NULL, parent, name, seq);
+	syncer_log_push(WAL_MKDIR, path, NULL, parent, name);
 	meta_mark_flags(parent, name, OMDFS_F_DIRTY_ATTR, 0); /* publish */
 	syncer_kick();
 	return 0;
@@ -322,8 +320,7 @@ static int omdfs_unlink(const char *path)
 	cache_path(cp, path);
 	unlink(cp); /* content may not be cached; ignore ENOENT */
 	evict_forget(path);
-	uint64_t seq = wal_append(WAL_UNLINK, path, NULL);
-	meta_pending_attach(in, seq, WAL_UNLINK, path, NULL);
+	syncer_log_attach(in, WAL_UNLINK, path, NULL);
 	syncer_kick();
 	return 0;
 }
@@ -354,8 +351,7 @@ static int omdfs_rmdir(const char *path)
 	snprintf(ip, sizeof(ip), "%s/%s", cp, OMDFS_INDEX_NAME);
 	unlink(ip);
 	rmdir(cp); /* best-effort */
-	uint64_t seq = wal_append(WAL_RMDIR, path, NULL);
-	meta_pending_attach(in, seq, WAL_RMDIR, path, NULL);
+	syncer_log_attach(in, WAL_RMDIR, path, NULL);
 	syncer_kick();
 	return 0;
 }
@@ -409,11 +405,10 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	if (r != 0)
 		return r;
 	evict_rename(from, to);
-	uint64_t seq = wal_append(WAL_RENAME, from, to);
-	/* Attach the rename's drain node to the pre-bumped indirection (pre-bumped under
-	 * the move's lock, so the flush never sees the moved entry dirty-and-settled
-	 * while its rename is undrained — Change 1), then publish. */
-	meta_pending_attach(moved_ind, seq, WAL_RENAME, from, to);
+	/* Append + enqueue the rename's drain node on the pre-bumped indirection
+	 * (pre-bumped under the move's lock, so the flush never sees the moved entry
+	 * dirty-and-settled while its rename is undrained — Change 1), then publish. */
+	syncer_log_attach(moved_ind, WAL_RENAME, from, to);
 	if (dst_dirty)
 		dirtyset_add(tp);
 	/* A renamed directory carries its dirty descendants to new paths; re-key
@@ -463,8 +458,7 @@ static int omdfs_symlink(const char *target, const char *path)
 		unlink(cp);
 		return r;
 	}
-	uint64_t seq = wal_append(WAL_SYMLINK, path, target);
-	meta_pending_push(WAL_SYMLINK, path, target, parent, name, seq);
+	syncer_log_push(WAL_SYMLINK, path, target, parent, name);
 	syncer_kick();
 	return 0;
 }

@@ -17,8 +17,26 @@
 #ifndef OMDFS_SYNCER_H
 #define OMDFS_SYNCER_H
 
+#include <stdint.h>
+
+struct ind;
+
 /* Spawn the syncer thread. Returns 0 or -1. */
 int syncer_start(void);
+
+/* Log a structural op and enqueue it on the drain queue. Called by the foreground
+ * FUSE handlers after the cache mutation; each does the on-disk WAL append, the
+ * indirection bookkeeping, and the enqueue, rolling back cleanly on failure (the op
+ * stays on disk and re-seeds next mount — never data loss). DESIGN.md § 2026-06-21.
+ *
+ * syncer_log_push: create/mkdir/symlink — resolves child (dir,name) to acquire +
+ *   bump its indirection (meta_ind_acquire).
+ * syncer_log_attach: unlink/rmdir/rename — the indirection `in` was already
+ *   pre-bumped and handed back by meta_remove_entry / meta_move_entry (may be NULL). */
+void syncer_log_push(uint8_t op, const char *path, const char *path2,
+		     const char *dir, const char *name);
+void syncer_log_attach(struct ind *in, uint8_t op, const char *path,
+		       const char *path2);
 
 /* Wake the thread to sync now (called after each foreground mutation). */
 void syncer_kick(void);

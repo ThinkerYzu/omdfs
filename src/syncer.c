@@ -107,14 +107,104 @@ static long long s_last_clean; /* epoch of the last fully-drained cycle */
 /* Set once the recovered structural WAL has fully drained. Until then the dirty
  * flush runs dry — recovered-dirty entries have no pending_count to gate them (the
  * seeded queue nodes carry ind == NULL), so we must not push one whose recovered
- * rename is still undrained (the recovery guard). s_recovery_max is the highest seq
- * seeded from the on-disk WAL at startup; recovery is done once the checkpoint has
- * caught up to it. Touched only on the syncer thread. */
+ * rename is still undrained (the recovery guard). s_recovery_target is the number of
+ * nodes seeded from the on-disk WAL at startup; recovery is done once that many nodes
+ * have drained (s_q_drained — a monotonic count, since the applied-count checkpoint
+ * resets on reclaim). Touched only on the syncer thread. */
 static int s_initial_drained;
-static uint64_t s_recovery_max;
+static uint64_t s_recovery_target;
 
 /* Guards the shared status/resync stat counters updated from pool workers. */
 static pthread_mutex_t s_stat_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---- structural drain queue (DESIGN.md § 2026-06-21) ----
+ *
+ * The in-memory FIFO of structural ops phase 1 applies. Each node owns a heap
+ * wal_record (op + paths, freed on drain) and a direct handle to the affected
+ * entry's indirection (NULL for a seeded recovery op). The foreground only appends
+ * at the tail (syncer_log_*); the syncer only pops the head — so the head is stable
+ * for the syncer between peek and pop. The on-disk WAL stays the durability/recovery
+ * log: read once at mount to seed this queue (sync_seed), otherwise only appended +
+ * checkpoint-truncated. All queue state under s_q_lock. */
+struct sync_op {
+	struct wal_record *rec;	/* owned: op + paths; freed with wal_record_free on pop */
+	struct ind *ind;	/* affected entry's indirection; NULL for seeded recovery */
+	struct sync_op *next;
+};
+static pthread_mutex_t s_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sync_op *s_q_head, *s_q_tail;
+static long s_q_len;
+static unsigned long s_q_drained; /* monotonic count of nodes drained since mount; the
+				   * recovery guard watches it (the applied-count
+				   * checkpoint resets on reclaim, so it can't serve). */
+
+/* Append a node taking ownership of `rec`. Returns 0, or -1 on OOM (the caller frees
+ * rec and rolls back any ind bump). */
+static int sync_enqueue(struct wal_record *rec, struct ind *in)
+{
+	struct sync_op *p = malloc(sizeof(*p));
+	if (!p)
+		return -1;
+	p->rec = rec;
+	p->ind = in;
+	p->next = NULL;
+	pthread_mutex_lock(&s_q_lock);
+	if (s_q_tail)
+		s_q_tail->next = p;
+	else
+		s_q_head = p;
+	s_q_tail = p;
+	s_q_len++;
+	pthread_mutex_unlock(&s_q_lock);
+	return 0;
+}
+
+/* Seed the queue from the on-disk pending WAL suffix (records[applied:]) as
+ * ind == NULL nodes — recovered ops drain by path; no live entry or flush exists yet.
+ * Returns the count seeded so the recovery guard knows when it has fully drained. */
+static uint64_t sync_seed(void)
+{
+	struct wal_record **recs = NULL;
+	size_t n = 0;
+	if (wal_load_pending(wal_applied(), &recs, &n) != 0)
+		return 0;
+	uint64_t seeded = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (sync_enqueue(recs[i], NULL) == 0)
+			seeded++;
+		else
+			wal_record_free(recs[i]); /* OOM: drop; re-seeds next mount */
+	}
+	free(recs);
+	return seeded;
+}
+
+void syncer_log_push(uint8_t op, const char *path, const char *path2,
+		     const char *dir, const char *name)
+{
+	struct wal_record *rec = wal_append(op, path, path2);
+	if (!rec)
+		return; /* the append failed: the op simply won't sync this mount */
+	struct ind *in = meta_ind_acquire(dir, name); /* NULL: entry vanished or OOM */
+	if (sync_enqueue(rec, in) != 0) {
+		meta_ind_unbump(in); /* OOM: undo the bump; op waits for the next mount */
+		wal_record_free(rec);
+	}
+}
+
+void syncer_log_attach(struct ind *in, uint8_t op, const char *path,
+		       const char *path2)
+{
+	struct wal_record *rec = wal_append(op, path, path2);
+	if (!rec) {
+		meta_ind_unbump(in); /* the append failed: roll the pre-bump back */
+		return;
+	}
+	if (sync_enqueue(rec, in) != 0) {
+		meta_ind_unbump(in); /* OOM */
+		wal_record_free(rec);
+	}
+}
 
 /* ---- bounded worker pool (parallel copy_file across backend connections) ----
  *
@@ -488,34 +578,51 @@ static int apply_structural(uint8_t op, const char *path, const char *path2)
 
 static void phase_structural(struct omdfs_status *st)
 {
-	uint64_t synced = wal_synced_seq();
-	uint64_t applied = synced;
+	uint64_t base = wal_applied(); /* applied count at cycle start (only we advance it) */
+	uint64_t drained = 0;
 	for (;;) {
-		struct pending_view v;
-		if (!meta_pending_peek(&v))
-			break; /* in-memory queue empty: nothing to drain */
+		/* Peek the head. Only the syncer pops and the foreground only appends at
+		 * the tail, so the head node stays valid (no one else frees it) until we
+		 * pop it below — we can hold the pointer across the apply off-lock. */
+		pthread_mutex_lock(&s_q_lock);
+		struct sync_op *p = s_q_head;
+		pthread_mutex_unlock(&s_q_lock);
+		if (!p)
+			break; /* queue empty: nothing to drain */
+		struct wal_record *rec = p->rec;
 		/* Flush exclusion (Change 3): a rename/unlink of a path a flush is
 		 * copying to must wait for that flush to finish. Stop here (strict
 		 * in-order); the flush's release lets a later cycle proceed. */
-		if ((v.op == WAL_RENAME || v.op == WAL_UNLINK) && v.is_flushing)
+		if ((rec->op == WAL_RENAME || rec->op == WAL_UNLINK) &&
+		    meta_ind_flushing(p->ind))
 			break;
-		const char *p2 = v.path2[0] ? v.path2 : NULL;
-		int err = apply_structural(v.op, v.path, p2);
+		int err = apply_structural(rec->op, rec->path, rec->path2);
 		if (err == 0) {
-			meta_pending_pop(v.seq); /* pops the head + decrements its ind */
-			applied = v.seq;
+			pthread_mutex_lock(&s_q_lock);
+			s_q_head = p->next;
+			if (!s_q_head)
+				s_q_tail = NULL;
+			s_q_len--;
+			s_q_drained++;
+			pthread_mutex_unlock(&s_q_lock);
+			meta_ind_settle(p->ind); /* drop the ind's pending_count */
+			wal_record_free(p->rec);
+			free(p);
+			drained++;
 			continue;
 		}
 		/* Strict in-order: the head op is blocked; surface it and stop. */
 		st->stuck_errno = err;
 		st->stuck = is_permanent(err);
-		snprintf(st->stuck_op, sizeof(st->stuck_op), "%s", op_name(v.op));
-		snprintf(st->stuck_path, sizeof(st->stuck_path), "%s", v.path);
+		snprintf(st->stuck_op, sizeof(st->stuck_op), "%s", op_name(rec->op));
+		snprintf(st->stuck_path, sizeof(st->stuck_path), "%s", rec->path);
 		break;
 	}
-	if (applied != synced)
-		wal_checkpoint(applied);
-	st->pending_structural += meta_pending_count();
+	if (drained)
+		wal_checkpoint(base + drained);
+	pthread_mutex_lock(&s_q_lock);
+	st->pending_structural += s_q_len;
+	pthread_mutex_unlock(&s_q_lock);
 }
 
 /* ---- phase 2: dirty flush ---- */
@@ -671,10 +778,10 @@ static void flush_submit(const char *fuse_dir, const struct omdfs_entry *e,
 	/* The flush gate (DESIGN.md Change 2): push an entry only once it and every
 	 * ancestor directory have no undrained structural op, so its backend path
 	 * exists at the right place. A gated entry is dry-counted (re-armed in the
-	 * dirty-set, no backend I/O); the syncer revisits it once the op drains
-	 * (meta_pending_drain kicks a cycle). This replaces the old push-then-retry on
-	 * a not-ready path, and is what makes the flush-before-rename clobber
-	 * impossible. */
+	 * dirty-set, no backend I/O); the syncer revisits it once the op drains (phase 1
+	 * drains it and phase 2 re-checks the gate in the same cycle). This replaces the
+	 * old push-then-retry on a not-ready path, and is what makes the flush-before-
+	 * rename clobber impossible. */
 	if (!meta_flushable(fuse_dir, e->name)) {
 		flush_entry(fuse_dir, e, ctx->st, 1);
 		return;
@@ -982,7 +1089,7 @@ int syncer_resync(void)
 {
 	struct omdfs_status st;
 	struct resync_stats rs;
-	meta_pending_seed(); /* offline: load any on-disk pending ops to drain by path */
+	sync_seed(); /* offline: load any on-disk pending ops to drain by path */
 	pool_start(); /* offline: no syncer thread has started one yet */
 	resync_reconcile(&rs, &st);
 	pool_stop();
@@ -1246,7 +1353,7 @@ static void sync_once(struct omdfs_status *st, int may_yield)
 	 * gate is complete. Until then run the flush "dry" (count the backlog + keep
 	 * the dirty-set, no backend I/O) so the status stays honest. In the common
 	 * case the recovered WAL drains in this very cycle, so there is no delay. */
-	if (!s_initial_drained && wal_synced_seq() >= s_recovery_max)
+	if (!s_initial_drained && s_q_drained >= s_recovery_target)
 		s_initial_drained = 1;
 
 	struct flush_ctx ctx = {
@@ -1361,9 +1468,9 @@ int syncer_start(void)
 			s_backoff_ms = v; /* 0 = disable backoff */
 	}
 	/* Seed the in-memory structural WAL from any ops a previous run left on disk
-	 * (recovery), before the drain thread starts. s_recovery_max gates real flushing
-	 * until those drain. */
-	s_recovery_max = meta_pending_seed();
+	 * (recovery), before the drain thread starts. s_recovery_target (the seeded node
+	 * count) gates real flushing until that many nodes have drained. */
+	s_recovery_target = sync_seed();
 	pool_start(); /* parallel copy workers, used from the first cycle on */
 	if (pthread_create(&s_thread, NULL, syncer_loop, NULL) != 0) {
 		pool_stop();

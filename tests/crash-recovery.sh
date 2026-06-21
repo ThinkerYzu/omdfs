@@ -177,6 +177,46 @@ if mount_omdfs; then ok "mounts with a torn WAL tail"; else no "mounts with a to
 [ "$(cat "$MNT/top.txt")" = "top level" ] && ok "data intact after torn-tail recovery" \
 	|| no "data intact after torn-tail recovery"
 
+# ---- interrupted-reclaim window: empty WAL + stale-high checkpoint ----
+# Simulate a crash in the reclaim window (DESIGN.md § 2026-06-20, positional-index
+# checkpoint): the WAL was truncated to empty but the checkpoint had not yet been
+# reset to 0, so on disk checkpoint > records. Recovery must clamp the applied count
+# to the records actually present (here 0) and durably rewrite the checkpoint, so a
+# later append is counted from 0 — never skipped against the stale-high value. Forge
+# the state directly: an empty WAL plus a checkpoint of 999.
+fusermount3 -u "$MNT" >/dev/null 2>&1; wait "$PID" 2>/dev/null; PID=""
+: > "$DATA/journal/wal"                                       # WAL empty
+printf '\xe7\x03\x00\x00\x00\x00\x00\x00' > "$DATA/journal/checkpoint"  # applied = 999 (LE u64)
+
+if mount_omdfs; then ok "mounts with a stale-high checkpoint (interrupted reclaim)"; \
+	else no "mounts with a stale-high checkpoint (interrupted reclaim)"; fi
+[ "$(cat "$MNT/top.txt")" = "top level" ] && ok "data intact after stale-checkpoint recovery" \
+	|| no "data intact after stale-checkpoint recovery"
+# The clamp must be durable: recovery rewrote the checkpoint down to 0.
+ck_is_zero() { [ "$(od -An -tu8 "$DATA/journal/checkpoint" 2>/dev/null | tr -d ' ')" = 0 ]; }
+wait_for "stale checkpoint self-healed to 0 at recovery" ck_is_zero
+
+# The decisive check: queue an UNLINK that can't sync (backend gone), crash before it
+# drains, then remount. With the clamp+rewrite the record sits at index 0 against a
+# checkpoint of 0, so recovery replays it and the file leaves the backend. WITHOUT the
+# fix the checkpoint is still 999 and recovery skips the index-0 record entirely, so
+# the deleted file is resurrected on the backend. (An UNLINK, unlike a CREATE, can't be
+# masked by the dirty-content flush re-creating the file — so this isolates the skip.)
+mv "$BACKEND" "$WORK/backend.gone3"
+rm "$MNT/top.txt"                              # UNLINK queued; can't sync (backend gone)
+sleep 0.5
+kill -9 "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
+fusermount3 -u "$MNT" >/dev/null 2>&1
+mv "$WORK/backend.gone3" "$BACKEND"
+[ -e "$BACKEND/top.txt" ] && ok "victim still on backend pre-replay" \
+	|| no "victim still on backend pre-replay"
+if ! mount_omdfs; then
+	echo "Bail out! omdfs failed to remount (stale-checkpoint replay); log follows:" >&2
+	cat "$WORK/omdfs.log" >&2; exit 98
+fi
+wait_for "unlink queued after a stale-checkpoint recovery is replayed, not skipped" \
+	test ! -e "$BACKEND/top.txt"
+
 # ---- summary ----
 echo "1..$COUNT"
 if [ "$FAIL" -ne 0 ]; then
