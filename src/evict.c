@@ -25,6 +25,7 @@
 
 #include <dirent.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -43,7 +44,11 @@
 
 static off_t g_budget; /* 0 = eviction disabled */
 static off_t g_high, g_low, g_hard;
-static int g_pressure; /* latched: over the hard limit with nothing clean to evict */
+/* Latched: over the hard limit with nothing clean to evict. Set/cleared from the
+ * foreground write path (evict_backpressure) and the syncer's sweep
+ * (evict_run_if_needed), read by the syncer for status/backoff — so it's atomic.
+ * Just a status flag with no ordering dependency on other state: relaxed is enough. */
+static atomic_int g_pressure;
 static pthread_mutex_t evict_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Join a FUSE dir and a child name into a FUSE path. */
@@ -215,7 +220,7 @@ void evict_run_if_needed(void)
 	 * under the limit — i.e. the un-evictable dirty content has synced and been
 	 * reclaimed — so the status flag doesn't flap right at the boundary. */
 	if (lru_total() < g_high)
-		g_pressure = 0;
+		atomic_store_explicit(&g_pressure, 0, memory_order_relaxed);
 }
 
 int evict_backpressure(off_t growth)
@@ -228,13 +233,14 @@ int evict_backpressure(off_t growth)
 	evict_run_if_needed();
 	if (lru_total() + growth <= g_hard)
 		return 0; /* reclaimed enough clean space */
-	g_pressure = 1; /* un-evictable: refuse the growth and latch the flag */
+	/* un-evictable: refuse the growth and latch the flag */
+	atomic_store_explicit(&g_pressure, 1, memory_order_relaxed);
 	return 1;
 }
 
 int evict_pressure(void)
 {
-	return g_pressure;
+	return atomic_load_explicit(&g_pressure, memory_order_relaxed);
 }
 
 off_t evict_total(void)
