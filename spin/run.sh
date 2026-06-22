@@ -17,6 +17,9 @@
 #                       and the read/fetch path's read-vs-rename race.
 #   omdfs-rename-replace.pml  cross-identity replacing rename: a flush of the replaced
 #                       entry must not clobber the survivor (the publish guard).
+#   omdfs-replace.pml   the write-back engine over the FULL rename op-space (name
+#                       decoupled from identity, so rename-ONTO-existing is generated):
+#                       convergence over every op sequence incl. replace.
 #
 # Usage: ./run.sh [--check] [--quick]
 set -u
@@ -109,6 +112,20 @@ echo "    (the current per-entry exclusion alone does NOT cover it -- needs the 
 run_cfg "buggy (no exclusion)"   bug  omdfs-rename-replace.pml "-a -N no_clobber" --
 run_cfg "current FIX only (gap)"  bug  omdfs-rename-replace.pml "-a -N no_clobber" -- -DFIX
 run_cfg "FIX + publish guard"    pass omdfs-rename-replace.pml "-a -N no_clobber" -- -DFIX -DPUBLISH_GUARD
+
+echo
+echo "[6] omdfs-replace.pml -- write-back engine over the FULL rename op-space (replace)"
+echo "    name decoupled from identity: the foreground can rename ONTO an existing entry."
+echo "    converge needs BOTH the exclusion AND the publish guard; buggy + FIX-only diverge."
+run_cfg "buggy (no exclusion)"     bug  omdfs-replace.pml "-a -N converge" -- -DMAXOPS=4
+run_cfg "FIX only (replace gap)"   bug  omdfs-replace.pml "-a -N converge" -- -DFIX -DMAXOPS=4
+run_cfg "fixed converge MAXOPS=4"  pass omdfs-replace.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=4
+run_cfg "fixed converge MAXOPS=5"  pass omdfs-replace.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=5
+if [ $QUICK = 0 ]; then
+	run_cfg "fixed converge MAXOPS=6" pass omdfs-replace.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=6
+fi
+echo "    deadlock-freedom (no never-claim):"
+run_cfg "fixed safety MAXOPS=5" pass omdfs-replace.pml "" -- -DNOLTL -DFIX -DPUBLISH_GUARD -DMAXOPS=5
 
 echo
 rm -f pan pan.* _spin_nvr.tmp spin.err cc.err
