@@ -290,6 +290,27 @@ wait_for "dirty file under renamed dir reaches new backend path" \
 	bcontent_eq "deep dirty" "$BACKEND/dd2/sub/f.txt"
 wait_for "renamed-away source dir is gone from backend" bgone "$BACKEND/dd"
 
+# --- rename onto an EXISTING directory (replace semantics) ---
+# rename(2) of a directory onto an existing directory must refuse a NON-EMPTY
+# target (ENOTEMPTY, like rmdir) and, for an EMPTY target, replace it -- carrying
+# the source's children to the new path, not dropping them. Regression for the bug
+# where meta_move_entry dropped the target's index entry while its cnode (and cache
+# dir) lived on and shadowed the move: silent data loss, cache vs backend divergence.
+# mv(1) would move the source INTO the dir, so call rename(2) directly.
+ren() { python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' "$1" "$2"; }
+mkdir "$MNT/rr_src" "$MNT/rr_dstne"
+echo src  > "$MNT/rr_src/a.txt"
+echo keep > "$MNT/rr_dstne/keep.txt"            # non-empty target
+assert_failure "rename onto non-empty dir is ENOTEMPTY" ren "$MNT/rr_src" "$MNT/rr_dstne"
+assert_success "rejected rename leaves source intact"   test -f "$MNT/rr_src/a.txt"
+assert_success "rejected rename leaves target intact"   test -f "$MNT/rr_dstne/keep.txt"
+mkdir "$MNT/rr_dste"                            # empty target
+assert_success "rename onto empty dir succeeds"         ren "$MNT/rr_src" "$MNT/rr_dste"
+assert_failure "replaced-rename source gone from mount" test -e "$MNT/rr_src"
+assert_eq "moved dir's child preserved at new path" "src" "$(cat "$MNT/rr_dste/a.txt" 2>/dev/null)"
+wait_for "replaced-rename child reaches new backend path" bcontent_eq "src" "$BACKEND/rr_dste/a.txt"
+wait_for "replaced-rename source gone from backend"       bgone "$BACKEND/rr_src"
+
 # --- root getattr is served from the local index, not the backend ---
 # stat($MNT) (path "/") must answer from the cached root index (its dir_st, the
 # same value readdir fills for "."), so the mount root remains stat-able with the

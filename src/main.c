@@ -368,6 +368,16 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	if (is_reserved(fn) || is_reserved(tn))
 		return -EPERM;
 
+	/* POSIX: renaming onto a directory requires it be empty. And replacing a
+	 * directory must tear down the destination's cached node + cache dir (below),
+	 * else meta_move_entry drops the target's index entry while its cnode lives on
+	 * and shadows the moved entry -- silent data loss, the index diverging from the
+	 * backend. The index is the source of truth, as in rmdir. */
+	size_t dst_n;
+	int dst_is_dir = (meta_dir_stat(to, NULL, &dst_n) == 0);
+	if (dst_is_dir && dst_n > 0)
+		return -ENOTEMPTY;
+
 	/* For a file, make sure its content is cached so it lives at the new cache
 	 * path and stays readable before the backend rename syncs. */
 	uint8_t ftype = 0;
@@ -384,12 +394,25 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	 * any in-flight write, then drops the stale-keyed nodes so they reparse from the
 	 * moved files on next access. (A no-op for a file rename.) */
 	meta_forget_tree(from);
+	/* Drop the (empty) destination directory's cached node too, so the moved entry
+	 * isn't shadowed by the stale target on the next lookup. */
+	if (dst_is_dir)
+		meta_forget_tree(to);
 
 	char cfrom[PATH_MAX], cto[PATH_MAX], ctodir[PATH_MAX];
 	cache_path(cfrom, from);
 	cache_path(cto, to);
 	cache_path(ctodir, tp);
 	mkdirs(ctodir);
+	/* Replacing an empty destination directory: remove its cache dir + index so the
+	 * rename below can move the source onto it (rename onto a non-empty dir ENOENTs/
+	 * ENOTEMPTYs). A no-op when the destination didn't exist. */
+	if (dst_is_dir) {
+		char dip[PATH_MAX];
+		snprintf(dip, sizeof(dip), "%s/%s", cto, OMDFS_INDEX_NAME);
+		unlink(dip);
+		rmdir(cto); /* best-effort; now empty */
+	}
 	/* Uncached file -> no cache file to move (ENOENT is fine). A cold-metadata
 	 * eviction may also have rmdir'd the destination cache dir between mkdirs and
 	 * here; on ENOENT recreate it once and retry so a cached file lands at its new
