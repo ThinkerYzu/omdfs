@@ -11,6 +11,10 @@
 #                       deadlock over every op sequence up to MAXOPS.
 #   omdfs-recovery.pml  crash recovery: WAL-suffix replay, stale-high checkpoint
 #                       clamp, and the s_initial_drained dry-flush guard.
+#   omdfs-impl.pml      function-by-function model of journal.c + meta.c + syncer.c
+#                       + content.c: the real functions over every op sequence, a
+#                       one-shot crash + remount (wal_init/sync_seed/recovery guard),
+#                       and the read/fetch path's read-vs-rename race.
 #
 # Usage: ./run.sh [--check] [--quick]
 set -u
@@ -74,6 +78,27 @@ for s in 1 2 3; do
 	run_cfg "buggy scenario $s" bug  omdfs-recovery.pml "" -- -DSCENARIO=$s
 	run_cfg "fixed scenario $s" pass omdfs-recovery.pml "" -- -DFIX -DSCENARIO=$s
 done
+
+echo
+echo "[4] omdfs-impl.pml -- journal.c + meta.c + syncer.c, function by function"
+echo "    convergence over all op sequences; buggy MUST diverge, fixed MUST converge"
+run_cfg "buggy live MAXOPS=3" bug  omdfs-impl.pml "-a -N converge" -- -DMAXOPS=3
+run_cfg "fixed live MAXOPS=3" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=3
+run_cfg "fixed live MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=4
+echo "    crash + remount (wal_init/sync_seed/recovery guard):"
+run_cfg "buggy crash MAXOPS=3" bug  omdfs-impl.pml "-a -N converge" -- -DCRASH -DMAXOPS=3
+run_cfg "fixed crash MAXOPS=3" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DCRASH -DMAXOPS=3
+run_cfg "fixed crash MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DCRASH -DMAXOPS=4
+if [ $QUICK = 0 ]; then
+	run_cfg "fixed live MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=5
+	run_cfg "fixed crash MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DCRASH -DMAXOPS=5
+	echo "    read-vs-rename fetch (content.c open_backend_for_fetch retry):"
+	echo "    a cold read of a renamed-but-not-yet-drained file: retry MUST find it, no-retry MUST ENOENT"
+	run_cfg "read no-retry MAXOPS=5" bug omdfs-impl.pml "" -- -DNOLTL -DFIX -DNOREADFIX -DMAXOPS=5
+fi
+echo "    deadlock-freedom (no never-claim):"
+run_cfg "fixed safety MAXOPS=4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DMAXOPS=4
+run_cfg "fixed safety crash M4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DCRASH -DMAXOPS=4
 
 echo
 rm -f pan pan.* _spin_nvr.tmp spin.err cc.err

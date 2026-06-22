@@ -188,7 +188,7 @@ make verify                  # all SPIN models; non-zero exit on any surprise
 make verify VFLAGS=--quick   # skip the largest bound
 ```
 
-`spin/` holds three SPIN/Promela models of the concurrency-critical core, each checked
+`spin/` holds four SPIN/Promela models of the concurrency-critical core, each checked
 from the buggy and the fixed side (so the check is shown able to catch the bug it rules
 out). Needs `spin` (tested with 6.5.2) and a C compiler; it does not build or mount
 omdfs.
@@ -200,6 +200,12 @@ omdfs.
   namespace, structural ordering holds, no deadlock.
 - `omdfs-recovery.pml` — **crash recovery**: WAL-suffix replay, the stale-high
   checkpoint clamp, and the `s_initial_drained` dry-flush guard.
+- `omdfs-impl.pml` — the **function-by-function** model: `journal.c`, `meta.c`,
+  `syncer.c`, and `content.c` mirrored as same-named inlines/proctypes over state that
+  maps 1:1 to the C structures (the on-disk WAL + checkpoint, the indirection table, the
+  in-memory drain queue, the content-cached bit). Runs the full pipeline over every op
+  sequence, plus a one-shot crash + remount that drives `wal_init`/`sync_seed`/the
+  recovery guard, and the read/fetch path's read-vs-rename race (`readok`).
 
 See the writeup in `proj_docs/omdfs/SPIN-VERIFICATION.md`.
 
