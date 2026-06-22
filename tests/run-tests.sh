@@ -311,6 +311,20 @@ assert_eq "moved dir's child preserved at new path" "src" "$(cat "$MNT/rr_dste/a
 wait_for "replaced-rename child reaches new backend path" bcontent_eq "src" "$BACKEND/rr_dste/a.txt"
 wait_for "replaced-rename source gone from backend"       bgone "$BACKEND/rr_src"
 
+# --- rename type mismatches (POSIX EISDIR / ENOTDIR) ---
+# A non-directory may not replace a directory (EISDIR), nor a directory replace a
+# non-directory (ENOTDIR); both must leave source and target untouched.
+mkdir "$MNT/tm_dir"; echo c > "$MNT/tm_dir/c.txt"
+echo f > "$MNT/tm_file"
+assert_failure "file onto a directory is EISDIR"     ren "$MNT/tm_file" "$MNT/tm_dir"
+assert_success "EISDIR leaves the file intact"       test -f "$MNT/tm_file"
+assert_success "EISDIR leaves the directory intact"  test -f "$MNT/tm_dir/c.txt"
+mkdir "$MNT/tm_dir2"; echo x > "$MNT/tm_dir2/x.txt"
+echo g > "$MNT/tm_file2"
+assert_failure "directory onto a file is ENOTDIR"    ren "$MNT/tm_dir2" "$MNT/tm_file2"
+assert_success "ENOTDIR leaves the directory intact" test -f "$MNT/tm_dir2/x.txt"
+assert_success "ENOTDIR leaves the file intact"      test -f "$MNT/tm_file2"
+
 # --- root getattr is served from the local index, not the backend ---
 # stat($MNT) (path "/") must answer from the cached root index (its dir_st, the
 # same value readdir fills for "."), so the mount root remains stat-able with the

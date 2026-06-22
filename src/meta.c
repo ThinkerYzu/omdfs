@@ -1488,6 +1488,25 @@ int meta_move_entry(const char *old_dir, const char *old_name,
 	int dst_dirty = 0; /* moved entry carries dirty flags -> new_dir is dirty */
 	struct ind *bumped = NULL; /* moved entry's ind, pre-bumped for the rename */
 
+	/* POSIX type compatibility, re-checked under meta_mtx so it is atomic with the
+	 * move: a directory may only replace a directory, a non-directory only a
+	 * non-directory. omdfs_rename pre-checks this, but re-checking here closes the
+	 * window for any racing (or future internal) caller -- the index, the source of
+	 * truth, is never left wrong. Best-effort via the live cache (the dirs are hot --
+	 * the caller just stat'd them, and the VFS holds the rename locks); a cold miss
+	 * falls through to the branch's own ENOENT handling. */
+	{
+		struct cnode *sn = cache_find(old_dir);
+		struct omdfs_entry *se = sn ? meta_lookup(&sn->idx, old_name) : NULL;
+		struct cnode *dn = !strcmp(old_dir, new_dir) ? sn : cache_find(new_dir);
+		struct omdfs_entry *de = dn ? meta_lookup(&dn->idx, new_name) : NULL;
+		if (se && de && de != se &&
+		    ((de->type == OMDFS_T_DIR) != (se->type == OMDFS_T_DIR))) {
+			r = (de->type == OMDFS_T_DIR) ? -EISDIR : -ENOTDIR;
+			goto out;
+		}
+	}
+
 	if (!strcmp(old_dir, new_dir)) {
 		struct omdfs_index *idx = cache_canonical(old_dir, &r);
 		if (!idx)

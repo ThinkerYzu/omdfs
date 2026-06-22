@@ -368,24 +368,40 @@ static int omdfs_rename(const char *from, const char *to, unsigned int flags)
 	if (is_reserved(fn) || is_reserved(tn))
 		return -EPERM;
 
-	/* POSIX: renaming onto a directory requires it be empty. And replacing a
-	 * directory must tear down the destination's cached node + cache dir (below),
-	 * else meta_move_entry drops the target's index entry while its cnode lives on
-	 * and shadows the moved entry -- silent data loss, the index diverging from the
-	 * backend. The index is the source of truth, as in rmdir. */
-	size_t dst_n;
-	int dst_is_dir = (meta_dir_stat(to, NULL, &dst_n) == 0);
-	if (dst_is_dir && dst_n > 0)
-		return -ENOTEMPTY;
-
-	/* For a file, make sure its content is cached so it lives at the new cache
-	 * path and stays readable before the backend rename syncs. */
+	/* Classify the source (also drives the cache prefetch + dirty-walk below) and
+	 * any existing destination, then apply POSIX rename rules. The index is the
+	 * source of truth, as in rmdir. (meta_move_entry re-checks the type rule under
+	 * meta_mtx, atomic with the move; the VFS holds the rename locks across this
+	 * call, so the destination can't change type/emptiness underneath us.) */
 	uint8_t ftype = 0;
-	int isfile = 0;
-	if (meta_stat(fp, fn, NULL, &ftype, NULL) == 0)
+	int isfile = 0, src_is_dir = 0;
+	if (meta_stat(fp, fn, NULL, &ftype, NULL) == 0) {
 		isfile = (ftype == OMDFS_T_FILE);
+		src_is_dir = (ftype == OMDFS_T_DIR);
+	}
+	/* Keep a file's content cached so it lives at the new cache path and stays
+	 * readable before the backend rename syncs. */
 	if (isfile)
 		content_prefetch(from); /* best-effort */
+
+	uint8_t dtype = 0;
+	int dst_is_dir = 0;
+	if (meta_stat(tp, tn, NULL, &dtype, NULL) == 0) {   /* destination exists */
+		dst_is_dir = (dtype == OMDFS_T_DIR);
+		if (dst_is_dir && !src_is_dir)
+			return -EISDIR;   /* a non-directory cannot replace a directory */
+		if (!dst_is_dir && src_is_dir)
+			return -ENOTDIR;  /* a directory cannot replace a non-directory */
+		if (dst_is_dir) {
+			/* Replacing a directory: it must be empty, and its cached node +
+			 * cache dir get torn down below so meta_move_entry's dropped target
+			 * can't shadow the moved entry (else silent data loss, the index
+			 * diverging from the backend). */
+			size_t dst_n = 0;
+			if (meta_dir_stat(to, NULL, &dst_n) == 0 && dst_n > 0)
+				return -ENOTEMPTY;
+		}
+	}
 
 	/* Drain + drop the from-subtree's cached indexes BEFORE physically moving its
 	 * cache directory below: a pending async index write-back keyed to an old path
