@@ -17,7 +17,7 @@ SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 BIN := omdfs
 
-.PHONY: all clean test stress
+.PHONY: all clean test stress verify
 all: $(BIN)
 
 test: $(BIN)
@@ -31,6 +31,11 @@ test: $(BIN)
 # Knobs: STRESS_SEED STRESS_OPS STRESS_ROUNDS STRESS_CACHE STRESS_MAXSZ.
 stress: $(BIN)
 	@tests/stress.sh ./$(BIN)
+
+# SPIN formal verification of the flush/structural-drain exclusion (needs `spin`).
+# Does not build omdfs; checks the Promela model in spin/. See spin/omdfs-flush.pml.
+verify:
+	@spin/run.sh --check
 
 $(BIN): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)

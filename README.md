@@ -181,6 +181,19 @@ make test
 filesystem behavior (TAP-style output), then unmounts and cleans up. It needs the
 FUSE 3 userspace tools (`fusermount3`) and permission to mount FUSE.
 
+### Formal verification
+
+```bash
+make verify
+```
+
+`spin/omdfs-flush.pml` is a SPIN/Promela model of the flush vs. structural-drain
+exclusion (the `pending_count` gate + `flushing` flag). `make verify` exhaustively
+checks that the historical *clobber* (a dirty flush overwritten by a not-yet-drained
+rename — see `tests/clobber.sh`) is reachable with the buggy syncer and unreachable
+with the fix. Needs `spin` (tested with 6.5.2) and a C compiler; it does not build or
+mount omdfs. See `spin/` and the writeup in `proj_docs/omdfs/SPIN-VERIFICATION.md`.
+
 ## Limitations
 
 - **Single writer only.** Concurrent writes from other clients are unsupported

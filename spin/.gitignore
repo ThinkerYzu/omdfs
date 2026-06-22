@@ -1,0 +1,8 @@
+# SPIN / pan build artifacts
+pan
+pan.*
+_spin_nvr.tmp
+*.trail.tmp
+spin.err
+cc.err
+omdfs-flush.pml.trail
