@@ -424,20 +424,22 @@ static void join_path(char out[PATH_MAX], const char *dir, const char *name)
 
 /* Copy a whole file src -> dst via a temp file + atomic rename. */
 #ifdef OMDFS_TEST_HOOKS
-/* TEST-ONLY deterministic publish gate (compiled out of normal builds). When
- * OMDFS_TEST_GATE_MATCH is set and the flush destination contains it, pause right
- * before rename(tmp,dst) -- the exact window where a concurrent replacing rename can
- * race a flush's publish. Signal readiness by creating <OMDFS_TEST_GATE_DIR>/ready,
- * then block until <...>/go appears (bounded). Inert unless the env vars are set. */
-static void test_copy_gate(const char *dst)
+/* TEST-ONLY deterministic publish gate (compiled out of normal builds). When the env var
+ * named `match_env` is set and the backend path contains it, pause right before the
+ * publish -- the exact window where a concurrent replacing rename can race a flush. Signal
+ * readiness by creating <OMDFS_TEST_GATE_DIR>/<ready>, then block until <...>/<go> appears
+ * (bounded). Two call sites (content rename, attr-only apply) use distinct env/file names
+ * so a test can drive each independently. Inert unless the env vars are set. */
+static void test_gate(const char *path, const char *match_env,
+		      const char *ready_name, const char *go_name)
 {
-	const char *m = getenv("OMDFS_TEST_GATE_MATCH");
+	const char *m = getenv(match_env);
 	const char *d = getenv("OMDFS_TEST_GATE_DIR");
-	if (!m || !d || !strstr(dst, m))
+	if (!m || !d || !strstr(path, m))
 		return;
 	char rp[PATH_MAX], gp[PATH_MAX];
-	snprintf(rp, sizeof(rp), "%s/ready", d);
-	snprintf(gp, sizeof(gp), "%s/go", d);
+	snprintf(rp, sizeof(rp), "%s/%s", d, ready_name);
+	snprintf(gp, sizeof(gp), "%s/%s", d, go_name);
 	int fd = open(rp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd >= 0)
 		close(fd);
@@ -490,7 +492,7 @@ static int copy_file(const char *src, const char *dst, struct ind *owner)
 		return err;
 	}
 #ifdef OMDFS_TEST_HOOKS
-	test_copy_gate(dst);
+	test_gate(dst, "OMDFS_TEST_GATE_MATCH", "ready", "go");
 #endif
 	if (owner)
 		return meta_flush_publish(owner, tmp, dst); /* gated: 0 / 1 superseded / -errno */
@@ -524,6 +526,30 @@ static int apply_stat_attrs(const char *bp, const struct stat *s)
 static int apply_attrs(const char *bp, const struct omdfs_entry *e)
 {
 	return apply_stat_attrs(bp, &e->st);
+}
+
+/* Apply a flush's attrs to the backend, atomic with the entry-removal check: if a
+ * replacing rename / unlink dropped the entry while this flush was in flight, skip the
+ * apply (its labels must not land on the successor now holding the path); otherwise apply
+ * under meta_mtx so the detached check and the chmod/chown/utimens are atomic with
+ * ind_release -- the same guarantee meta_flush_publish gives the content rename (see
+ * omdfs-rename-replace.pml). Returns 1 if applied or skipped-because-gone (both fine), or
+ * 0 on a backend error (the caller retries). */
+static int flush_apply_attrs(struct ind *fin, const char *bp,
+			     const struct omdfs_entry *e)
+{
+#ifdef OMDFS_NO_ATTR_GUARD
+	/* TEST-ONLY (compiled out of normal builds): the pre-fix unguarded apply, so the
+	 * attr-race regression can show it clobbers without the guard. */
+	(void)fin;
+	return apply_attrs(bp, e) == 0;
+#else
+	if (!meta_flush_attr_begin(fin))
+		return 1; /* superseded: entry gone, nothing to stamp */
+	int r = apply_attrs(bp, e); /* meta_mtx held: only backend syscalls below */
+	meta_flush_attr_end();
+	return r == 0;
+#endif
 }
 
 /* ---- phase 1: structural drain ---- */
@@ -735,17 +761,21 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 		char cp[PATH_MAX];
 		cache_path(cp, fpath);
 		int rc = copy_file(cp, bp, fin); /* publish gated against a replacing rename */
-		if (rc == 0)
-			apply_attrs(bp, &cur); /* contents landed, now its labels */
-		else if (rc < 0)
+		if (rc == 0) {
+			if (!flush_apply_attrs(fin, bp, &cur)) /* its labels, gated like the content */
+				ok = 0; /* backend path not ready — retry (see the contract above) */
+		} else if (rc < 0)
 			ok = 0; /* backend path not ready — retry (see the contract above) */
 		/* rc == 1: a replacing rename / unlink dropped this entry mid-flush; its
 		 * snapshot is stale and was discarded unpublished. Don't stamp attrs on the
 		 * successor, don't re-dirty -- the entry is gone. See omdfs-rename-replace.pml. */
 	} else if (claimed & OMDFS_F_DIRTY_ATTR) {
-		/* Attr-only push: skip it if the entry was replaced/removed, so we don't stamp
-		 * a gone entry's labels onto whatever now holds its path. */
-		if (!meta_ind_detached(fin) && apply_attrs(bp, &cur) != 0)
+		/* Attr-only push: gated the same way -- if the entry was replaced/removed, skip
+		 * so we don't stamp a gone entry's labels onto whatever now holds its path. */
+#ifdef OMDFS_TEST_HOOKS
+		test_gate(bp, "OMDFS_TEST_ATTR_MATCH", "attr_ready", "attr_go");
+#endif
+		if (!flush_apply_attrs(fin, bp, &cur))
 			ok = 0; /* backend path not ready — retry (see the contract above) */
 	}
 	if (!ok) {

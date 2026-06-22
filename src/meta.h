@@ -147,8 +147,13 @@ void meta_flush_release(struct ind *in);
  * or -errno (rename failed). A NULL `in` always publishes. See omdfs-rename-replace.pml. */
 int meta_flush_publish(struct ind *in, const char *tmp, const char *dst);
 
-/* True if the flush's entry `in` was detached (replaced/removed) since the claim. */
-int meta_ind_detached(struct ind *in);
+/* Guard for a flush's attr publish (several syscalls, unlike the single rename
+ * meta_flush_publish wraps). meta_flush_attr_begin returns 1 with meta_mtx HELD if the
+ * entry is still live, or 0 (unlocked) if it was replaced/removed; the caller then runs
+ * only backend syscalls (no meta_* calls) and calls meta_flush_attr_end to release. Keeps
+ * the detached check atomic with the attr apply. See omdfs-rename-replace.pml. */
+int meta_flush_attr_begin(struct ind *in);
+void meta_flush_attr_end(void);
 
 /* Mark every child of `fuse_dir` dirty so the background syncer re-pushes it:
  * OMDFS_F_DIRTY_ATTR on every entry, plus OMDFS_F_DIRTY_CONTENT on regular files

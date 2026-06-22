@@ -1808,14 +1808,26 @@ int meta_flush_publish(struct ind *in, const char *tmp, const char *dst)
 	return r;
 }
 
-/* True if the flush's entry was detached (replaced/removed) since the claim -- used to
- * skip an attr-only push onto a path whose owner is gone. meta_mtx held. */
-int meta_ind_detached(struct ind *in)
+/* Guard for a flush's attr publish (chmod/chown/utimens -- several syscalls, not the
+ * single rename meta_flush_publish wraps). meta_flush_attr_begin returns 1 with meta_mtx
+ * HELD if the flushing entry is still live, or 0 (lock NOT held) if it was replaced /
+ * removed. The caller then runs ONLY backend syscalls -- no meta_* calls, the lock is
+ * held -- and calls meta_flush_attr_end to release. This keeps the detached check atomic
+ * with the attr apply, exactly as meta_flush_publish does for the content rename, so a
+ * gone entry's labels can never land on the successor that now holds its path. */
+int meta_flush_attr_begin(struct ind *in)
 {
 	pthread_mutex_lock(&meta_mtx);
-	int d = in ? in->detached : 0;
+	if (in && in->detached) {
+		pthread_mutex_unlock(&meta_mtx);
+		return 0;
+	}
+	return 1; /* live: meta_mtx stays held until meta_flush_attr_end */
+}
+
+void meta_flush_attr_end(void)
+{
 	pthread_mutex_unlock(&meta_mtx);
-	return d;
 }
 
 /* Start the async index-writer thread. Call once at mount, before any FUSE op or
