@@ -184,15 +184,24 @@ FUSE 3 userspace tools (`fusermount3`) and permission to mount FUSE.
 ### Formal verification
 
 ```bash
-make verify
+make verify                  # all SPIN models; non-zero exit on any surprise
+make verify VFLAGS=--quick   # skip the largest bound
 ```
 
-`spin/omdfs-flush.pml` is a SPIN/Promela model of the flush vs. structural-drain
-exclusion (the `pending_count` gate + `flushing` flag). `make verify` exhaustively
-checks that the historical *clobber* (a dirty flush overwritten by a not-yet-drained
-rename — see `tests/clobber.sh`) is reachable with the buggy syncer and unreachable
-with the fix. Needs `spin` (tested with 6.5.2) and a C compiler; it does not build or
-mount omdfs. See `spin/` and the writeup in `proj_docs/omdfs/SPIN-VERIFICATION.md`.
+`spin/` holds three SPIN/Promela models of the concurrency-critical core, each checked
+from the buggy and the fixed side (so the check is shown able to catch the bug it rules
+out). Needs `spin` (tested with 6.5.2) and a C compiler; it does not build or mount
+omdfs.
+
+- `omdfs-flush.pml` — the flush vs. structural-drain **exclusion** (`pending_count`
+  gate + `flushing` flag) on the single-entry clobber (cf. `tests/clobber.sh`).
+- `omdfs-syncer.pml` — the **whole write-back engine** (create/mkdir/unlink/rmdir/
+  rename/write) over *every* op sequence up to a bound: backend converges to the live
+  namespace, structural ordering holds, no deadlock.
+- `omdfs-recovery.pml` — **crash recovery**: WAL-suffix replay, the stale-high
+  checkpoint clamp, and the `s_initial_drained` dry-flush guard.
+
+See the writeup in `proj_docs/omdfs/SPIN-VERIFICATION.md`.
 
 ## Limitations
 

@@ -32,10 +32,13 @@ test: $(BIN)
 stress: $(BIN)
 	@tests/stress.sh ./$(BIN)
 
-# SPIN formal verification of the flush/structural-drain exclusion (needs `spin`).
-# Does not build omdfs; checks the Promela model in spin/. See spin/omdfs-flush.pml.
+# SPIN formal verification (needs `spin`). Does not build omdfs; checks the Promela
+# models in spin/ (flush exclusion, write-back engine, crash recovery). See
+# spin/run.sh and proj_docs/omdfs/SPIN-VERIFICATION.md.  `make verify VFLAGS=--quick`
+# skips the largest bound.
+VFLAGS ?=
 verify:
-	@spin/run.sh --check
+	@spin/run.sh --check $(VFLAGS)
 
 $(BIN): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
