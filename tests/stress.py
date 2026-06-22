@@ -309,9 +309,17 @@ def cmd_apply(args):
             src = m.pick_any()
             if src is None:
                 continue
-            dst = m.fresh_path()
+            # Usually a fresh name, but ~40% of the time an EXISTING destination, so
+            # the overwrite / replace / EISDIR / ENOTDIR / ENOTEMPTY paths get
+            # exercised too -- not just rename-to-a-new-name. The control fs is the
+            # oracle for whichever outcome each (src type, dst type, emptiness) hits.
+            dst = m.pick_any(include_root=False) if rng.random() < 0.4 else None
+            if dst is None:
+                dst = m.fresh_path()
+            if dst == src:
+                continue
             # never move a dir into its own subtree
-            if src in m.dirs and (dst == src or dst.startswith(src + "/")):
+            if src in m.dirs and dst.startswith(src + "/"):
                 continue
 
             def fn_pair():
@@ -377,7 +385,21 @@ def self_empty_dirs(m):
     return [d for d in m.dirs if d and d not in parents]
 
 
+def model_remove(m, path):
+    """Drop `path` and any descendants from every table (the root is never removed)."""
+    for table in (m.dirs, m.files, m.links):
+        for p in [k for k in table if k and (k == path or k.startswith(path + "/"))]:
+            table.pop(p, None)
+
+
 def rename_in_model(m, src, dst):
+    # Called only when the rename SUCCEEDED on the real filesystem, so any existing
+    # destination was validly replaced: a file/symlink overwrite, or an empty
+    # directory replaced by the source. Clear it (and any stale descendants) before
+    # re-keying the source onto it -- otherwise the destination's old entry would
+    # linger in the model (and a symlink overwritten by a file would sit in two
+    # tables at once).
+    model_remove(m, dst)
     if src in m.files:
         m.files[dst] = m.files.pop(src)
     elif src in m.links:
