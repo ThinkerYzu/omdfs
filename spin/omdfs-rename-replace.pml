@@ -32,13 +32,17 @@
  *
  * The fix (PUBLISH_GUARD) -- as shipped, "validate at publish"
  * ------------------------------------------------------------
- *   The flush's publish (copy_file's rename(tmp,dst)) is made atomic, under meta_mtx,
- *   with a check that the flushing entry is still live (its indirection not detached by
- *   the replace's ind_release). A superseded flush -- one whose entry was replaced/
- *   removed mid-copy -- discards its temp instead of publishing, so it can never clobber
- *   the path's new owner. This is meta_flush_publish() in the C. Because the structural
- *   rename can only land AFTER the replace detaches B, by the time B's publish could win
- *   the race B is already detached -- so the locked check discards it.
+ *   The flush's publish is made atomic, under meta_mtx, with a check that the flushing
+ *   entry is still live (its indirection not detached by the replace's ind_release). A
+ *   superseded flush -- one whose entry was replaced/removed mid-flush -- is discarded
+ *   instead of publishing, so it can never clobber the path's new owner. This single
+ *   abstract guard maps to BOTH C publish primitives: meta_flush_publish() for the content
+ *   rename(tmp,dst), and meta_flush_attr_begin/end() for the attr apply (chmod/utimens) --
+ *   content bytes vs attrs is immaterial to the race, so one model covers both. Likewise
+ *   b_gone abstracts the entry being dropped by EITHER a replacing rename OR an unlink
+ *   (both call ind_release). Because the structural rename can only land AFTER the replace
+ *   detaches B, by the time B's publish could win the race B is already detached -- so the
+ *   locked check discards it.
  *
  * Switches:
  *   FIX            model the current per-entry exclusion (gate + flushing-defer on the
