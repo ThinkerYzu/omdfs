@@ -15,6 +15,8 @@
 #                       + content.c: the real functions over every op sequence, a
 #                       one-shot crash + remount (wal_init/sync_seed/recovery guard),
 #                       and the read/fetch path's read-vs-rename race.
+#   omdfs-rename-replace.pml  cross-identity replacing rename: a flush of the replaced
+#                       entry must not clobber the survivor (the publish guard).
 #
 # Usage: ./run.sh [--check] [--quick]
 set -u
@@ -99,6 +101,14 @@ fi
 echo "    deadlock-freedom (no never-claim):"
 run_cfg "fixed safety MAXOPS=4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DMAXOPS=4
 run_cfg "fixed safety crash M4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DCRASH -DMAXOPS=4
+
+echo
+echo "[5] omdfs-rename-replace.pml -- cross-identity replacing rename"
+echo "    a flush of the REPLACED entry must not clobber the survivor at the shared path"
+echo "    (the current per-entry exclusion alone does NOT cover it -- needs the publish guard)"
+run_cfg "buggy (no exclusion)"   bug  omdfs-rename-replace.pml "-a -N no_clobber" --
+run_cfg "current FIX only (gap)"  bug  omdfs-rename-replace.pml "-a -N no_clobber" -- -DFIX
+run_cfg "FIX + publish guard"    pass omdfs-rename-replace.pml "-a -N no_clobber" -- -DFIX -DPUBLISH_GUARD
 
 echo
 rm -f pan pan.* _spin_nvr.tmp spin.err cc.err

@@ -423,7 +423,34 @@ static void join_path(char out[PATH_MAX], const char *dir, const char *name)
 }
 
 /* Copy a whole file src -> dst via a temp file + atomic rename. */
-static int copy_file(const char *src, const char *dst)
+#ifdef OMDFS_TEST_HOOKS
+/* TEST-ONLY deterministic publish gate (compiled out of normal builds). When
+ * OMDFS_TEST_GATE_MATCH is set and the flush destination contains it, pause right
+ * before rename(tmp,dst) -- the exact window where a concurrent replacing rename can
+ * race a flush's publish. Signal readiness by creating <OMDFS_TEST_GATE_DIR>/ready,
+ * then block until <...>/go appears (bounded). Inert unless the env vars are set. */
+static void test_copy_gate(const char *dst)
+{
+	const char *m = getenv("OMDFS_TEST_GATE_MATCH");
+	const char *d = getenv("OMDFS_TEST_GATE_DIR");
+	if (!m || !d || !strstr(dst, m))
+		return;
+	char rp[PATH_MAX], gp[PATH_MAX];
+	snprintf(rp, sizeof(rp), "%s/ready", d);
+	snprintf(gp, sizeof(gp), "%s/go", d);
+	int fd = open(rp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0)
+		close(fd);
+	for (int i = 0; i < 600 && access(gp, F_OK) != 0; i++)
+		nanosleep(&(struct timespec){ 0, 100 * 1000 * 1000 }, NULL);
+}
+#endif
+
+/* `owner` is the flushing entry's indirection (NULL for non-flush copies such as
+ * resync): the final publish is gated through meta_flush_publish so a flush whose entry
+ * was replaced/removed mid-copy discards its temp instead of clobbering the successor.
+ * Returns 0 (published), 1 (superseded), or -errno. */
+static int copy_file(const char *src, const char *dst, struct ind *owner)
 {
 	int sfd = open(src, O_RDONLY);
 	if (sfd < 0)
@@ -462,6 +489,11 @@ static int copy_file(const char *src, const char *dst)
 		unlink(tmp);
 		return err;
 	}
+#ifdef OMDFS_TEST_HOOKS
+	test_copy_gate(dst);
+#endif
+	if (owner)
+		return meta_flush_publish(owner, tmp, dst); /* gated: 0 / 1 superseded / -errno */
 	if (rename(tmp, dst) != 0) {
 		int e = -errno;
 		unlink(tmp);
@@ -702,12 +734,18 @@ static void flush_entry(const char *fuse_dir, const struct omdfs_entry *e,
 	if (claimed & OMDFS_F_DIRTY_CONTENT) {
 		char cp[PATH_MAX];
 		cache_path(cp, fpath);
-		if (copy_file(cp, bp) == 0)
+		int rc = copy_file(cp, bp, fin); /* publish gated against a replacing rename */
+		if (rc == 0)
 			apply_attrs(bp, &cur); /* contents landed, now its labels */
-		else
+		else if (rc < 0)
 			ok = 0; /* backend path not ready — retry (see the contract above) */
+		/* rc == 1: a replacing rename / unlink dropped this entry mid-flush; its
+		 * snapshot is stale and was discarded unpublished. Don't stamp attrs on the
+		 * successor, don't re-dirty -- the entry is gone. See omdfs-rename-replace.pml. */
 	} else if (claimed & OMDFS_F_DIRTY_ATTR) {
-		if (apply_attrs(bp, &cur) != 0)
+		/* Attr-only push: skip it if the entry was replaced/removed, so we don't stamp
+		 * a gone entry's labels onto whatever now holds its path. */
+		if (!meta_ind_detached(fin) && apply_attrs(bp, &cur) != 0)
 			ok = 0; /* backend path not ready — retry (see the contract above) */
 	}
 	if (!ok) {
@@ -948,7 +986,7 @@ struct resync_arg {
 static void resync_copy_worker(void *p)
 {
 	struct resync_arg *a = p;
-	if (copy_file(a->cpath, a->bpath) != 0) { /* tmp + rename: replaces 0444 */
+	if (copy_file(a->cpath, a->bpath, NULL) != 0) { /* tmp + rename: replaces 0444 */
 		rs_fail(a->rs);
 	} else {
 		apply_stat_attrs(a->bpath, &a->st);
@@ -1016,7 +1054,7 @@ static void resync_entry(const char *fuse_dir, const struct omdfs_entry *e,
 			free(a);
 		}
 		/* OOM: copy inline. */
-		if (copy_file(cp, bp) != 0) {
+		if (copy_file(cp, bp, NULL) != 0) {
 			rs_fail(rs);
 			return;
 		}

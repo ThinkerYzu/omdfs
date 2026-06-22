@@ -140,6 +140,16 @@ int meta_flush_claim(const char *fuse_dir, const char *name,
  * indirection if nothing references it anymore. `in` is the pointer from out_ind. */
 void meta_flush_release(struct ind *in);
 
+/* Atomic publish-or-discard for a completed content flush. Renames tmp -> dst iff the
+ * flushing entry `in` is still live (not detached by a replacing rename / unlink),
+ * serialized against ind_release under meta_mtx so a stale flush can never clobber the
+ * path's replacement. Returns 0 (published), 1 (superseded — entry gone, tmp discarded),
+ * or -errno (rename failed). A NULL `in` always publishes. See omdfs-rename-replace.pml. */
+int meta_flush_publish(struct ind *in, const char *tmp, const char *dst);
+
+/* True if the flush's entry `in` was detached (replaced/removed) since the claim. */
+int meta_ind_detached(struct ind *in);
+
 /* Mark every child of `fuse_dir` dirty so the background syncer re-pushes it:
  * OMDFS_F_DIRTY_ATTR on every entry, plus OMDFS_F_DIRTY_CONTENT on regular files
  * whose content is cached (symlinks carry no flushable state, only existence).

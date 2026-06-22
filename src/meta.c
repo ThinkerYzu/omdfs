@@ -1785,6 +1785,39 @@ void meta_flush_release(struct ind *in)
 	pthread_mutex_unlock(&meta_mtx);
 }
 
+/* Publish a completed content flush atomically against entry removal. If the flushing
+ * entry is still live (its indirection is not detached), rename tmp -> dst (the backend
+ * publish) and return 0, or -errno on a rename failure. If a replacing rename / unlink
+ * dropped the entry while this flush was in flight, the snapshot is stale: discard tmp
+ * and return 1 (superseded). meta_mtx spans the rename so this serializes with
+ * ind_release -- a flush can never publish onto a path whose owner was replaced, which
+ * would clobber the replacement (see omdfs-rename-replace.pml). A NULL ind (e.g. resync,
+ * no live entry) always publishes. */
+int meta_flush_publish(struct ind *in, const char *tmp, const char *dst)
+{
+	pthread_mutex_lock(&meta_mtx);
+	if (in && in->detached) {
+		pthread_mutex_unlock(&meta_mtx);
+		unlink(tmp);
+		return 1;
+	}
+	int r = (rename(tmp, dst) != 0) ? -errno : 0;
+	pthread_mutex_unlock(&meta_mtx);
+	if (r != 0)
+		unlink(tmp);
+	return r;
+}
+
+/* True if the flush's entry was detached (replaced/removed) since the claim -- used to
+ * skip an attr-only push onto a path whose owner is gone. meta_mtx held. */
+int meta_ind_detached(struct ind *in)
+{
+	pthread_mutex_lock(&meta_mtx);
+	int d = in ? in->detached : 0;
+	pthread_mutex_unlock(&meta_mtx);
+	return d;
+}
+
 /* Start the async index-writer thread. Call once at mount, before any FUSE op or
  * the syncer (which clears dirty flags via meta_mark_flags). Until this runs, the
  * mutators persist synchronously (the offline tools' path). Returns 0 or -errno. */
