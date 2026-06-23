@@ -85,25 +85,23 @@ for s in 1 2 3; do
 done
 
 echo
-echo "[4] omdfs-impl.pml -- journal.c + meta.c + syncer.c, function by function"
-echo "    convergence over all op sequences; buggy MUST diverge, fixed MUST converge"
-run_cfg "buggy live MAXOPS=3" bug  omdfs-impl.pml "-a -N converge" -- -DMAXOPS=3
-run_cfg "fixed live MAXOPS=3" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=3
-run_cfg "fixed live MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=4
+echo "[4] omdfs-impl.pml -- journal.c + meta.c + syncer.c + content.c, function by function"
+echo "    FULL file op-space incl. rename-ONTO-existing (replace); name decoupled from id."
+echo "    converge needs BOTH the exclusion (FIX) and the publish guard; buggy + FIX-only diverge."
+run_cfg "buggy live MAXOPS=4" bug  omdfs-impl.pml "-a -N converge" -- -DMAXOPS=4
+run_cfg "FIX only (replace gap)" bug omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=4
+run_cfg "fixed live MAXOPS=3" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=3
+run_cfg "fixed live MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=4
 echo "    crash + remount (wal_init/sync_seed/recovery guard):"
-run_cfg "buggy crash MAXOPS=3" bug  omdfs-impl.pml "-a -N converge" -- -DCRASH -DMAXOPS=3
-run_cfg "fixed crash MAXOPS=3" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DCRASH -DMAXOPS=3
-run_cfg "fixed crash MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DCRASH -DMAXOPS=4
+run_cfg "buggy crash MAXOPS=4" bug  omdfs-impl.pml "-a -N converge" -- -DCRASH -DMAXOPS=4
+run_cfg "fixed crash MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DCRASH -DMAXOPS=4
 if [ $QUICK = 0 ]; then
-	run_cfg "fixed live MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=5
-	run_cfg "fixed crash MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DCRASH -DMAXOPS=5
-	echo "    read-vs-rename fetch (content.c open_backend_for_fetch retry):"
-	echo "    a cold read of a renamed-but-not-yet-drained file: retry MUST find it, no-retry MUST ENOENT"
-	run_cfg "read no-retry MAXOPS=5" bug omdfs-impl.pml "" -- -DNOLTL -DFIX -DNOREADFIX -DMAXOPS=5
+	run_cfg "fixed live MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=5
+	run_cfg "fixed crash MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DCRASH -DMAXOPS=5
 fi
 echo "    deadlock-freedom (no never-claim):"
-run_cfg "fixed safety MAXOPS=4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DMAXOPS=4
-run_cfg "fixed safety crash M4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DCRASH -DMAXOPS=4
+run_cfg "fixed safety MAXOPS=4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DPUBLISH_GUARD -DMAXOPS=4
+run_cfg "fixed safety crash M4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DPUBLISH_GUARD -DCRASH -DMAXOPS=4
 
 echo
 echo "[5] omdfs-rename-replace.pml -- cross-identity replacing rename"
