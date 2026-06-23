@@ -37,8 +37,7 @@
  * the same entry is never flushed twice at once because the claim clears dirty) --
  * the critical phase-1-vs-phase-2 concurrency is fully modeled (separate processes).
  *
- * Switches: -DFIX (model the fixed syncer; omit for the buggy pre-exclusion one),
- *           -DMAXOPS=n (foreground program length; default 3).
+ * Switches: -DMAXOPS=n (foreground program length; default 3).
  */
 
 #ifndef MAXOPS
@@ -77,14 +76,9 @@ byte wlen;            /* # records in the WAL (len()/empty() aren't allowed in L
 
 bool fg_done;
 
-/* FIX vs BUGGY, isolated to two macros */
-#ifdef FIX
+/* per-entry exclusion: the flushing flag + the pending-count gate */
 #define EXCL_OK(o,i)   ( ((o) != RENAMEF && (o) != UNLINKF) || !flushing[i] )
 #define GATE(i)        ( pcount[i] == 0 && (fdir[i] != D || pcount[DIRX] == 0) )
-#else
-#define EXCL_OK(o,i)   ( true )
-#define GATE(i)        ( true )
-#endif
 
 /* apply one drained structural record to the backend (no lock held) */
 inline apply_head(o, i, a, b) {
@@ -187,15 +181,11 @@ inline flush_one(i) {
 	atomic {                           /* meta_flush_claim: snapshot, clear dirty, mark flushing */
 		dirty[i] && GATE(i) ->
 		sp = fdir[i]; sv = ver[i]; dirty[i] = false;
-#ifdef FIX
 		flushing[i] = true;
-#endif
 	}
 	if :: sp == D -> assert(bdir) :: else -> skip fi;     /* parent exists at push time */
 	bpres[SLOT(sp,i)] = true; bver[SLOT(sp,i)] = sv;      /* the push (off-lock) */
-#ifdef FIX
 	flushing[i] = false;
-#endif
 }
 
 active proctype phase2() {

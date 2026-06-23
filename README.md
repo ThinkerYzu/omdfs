@@ -188,10 +188,9 @@ make verify                  # all SPIN models; non-zero exit on any surprise
 make verify VFLAGS=--quick   # skip the largest bound
 ```
 
-`spin/` holds four SPIN/Promela models of the concurrency-critical core, each checked
-from the buggy and the fixed side (so the check is shown able to catch the bug it rules
-out). Needs `spin` (tested with 6.5.2) and a C compiler; it does not build or mount
-omdfs.
+`spin/` holds six SPIN/Promela models of the concurrency-critical core, each modeling
+the shipped design; all configurations are expected to pass. Needs `spin` (tested with
+6.5.2) and a C compiler; it does not build or mount omdfs.
 
 - `omdfs-flush.pml` — the flush vs. structural-drain **exclusion** (`pending_count`
   gate + `flushing` flag) on the single-entry clobber (cf. `tests/clobber.sh`).
@@ -206,6 +205,10 @@ omdfs.
   in-memory drain queue, the content-cached bit). Runs the full pipeline over every op
   sequence, plus a one-shot crash + remount that drives `wal_init`/`sync_seed`/the
   recovery guard, and the read/fetch path's read-vs-rename race (`readok`).
+- `omdfs-rename-replace.pml` — the **cross-identity replacing rename**: a flush of the
+  *replaced* entry must not clobber the survivor at the shared path (the publish guard).
+- `omdfs-replace.pml` — the write-back engine over the **full rename op-space** (name
+  decoupled from identity, so *rename-onto-existing* is generated) over every op sequence.
 
 See the writeup in `proj_docs/omdfs/SPIN-VERIFICATION.md`.
 

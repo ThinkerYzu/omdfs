@@ -22,17 +22,16 @@
  *               only on an empty dir).
  *   + SPIN invalid-end-state => no deadlock.
  *
- * The fix has TWO parts, each its own switch (the shipped fix is FIX + PUBLISH_GUARD):
- *   FIX          per-entry exclusion: the flush gate (entry + ancestor dir pcount==0)
- *                and FLUSHING_DEFER (phase 1 defers a rename/unlink of a *flushing*
- *                entity). Handles SAME-entity races. Does NOT cover replace -- a
+ * The shipped design has TWO cooperating mechanisms:
+ *   per-entry exclusion  the flush gate (entry + ancestor dir pcount==0) and
+ *                FLUSHING_DEFER (phase 1 defers a rename/unlink of a *flushing* entity).
+ *                Handles SAME-entity races. Alone it does NOT cover replace -- a
  *                replacing rename is logged on the SOURCE, the dropped destination is
- *                never deferred, so its in-flight flush still clobbers.
- *   PUBLISH_GUARD validate-at-publish: a flush publishes only if its entity has not been
+ *                never deferred, so its in-flight flush would still clobber.
+ *   publish guard validate-at-publish: a flush publishes only if its entity has not been
  *                dropped (replaced/unlinked) since the claim -- the epoch is unchanged.
  *                This is meta_flush_publish() / meta_flush_attr_begin() in the C. It
- *                closes the cross-identity clobber. (See omdfs-rename-replace.pml for
- *                the focused proof that FIX alone leaves the gap.)
+ *                closes the cross-identity clobber that exclusion alone leaves open.
  *
  * Namespace bound (minimal to make a rename collide): NF=2 identities, NN=2 names,
  * dirs {root, d}; (dir,name) = 4 backend slots. Two identities competing for names is
@@ -41,7 +40,7 @@
  * are a further stage -- they need transitive-path remap of a renamed subtree; here d
  * is a fixed optional subdir, as in omdfs-syncer.pml.
  *
- * Switches: -DFIX, -DPUBLISH_GUARD, -DMAXOPS=n (default 4), -DNOLTL (deadlock/assert).
+ * Switches: -DMAXOPS=n (default 4), -DNOLTL (deadlock/assert).
  */
 
 #ifndef MAXOPS
@@ -88,14 +87,9 @@ bool fg_done;
 #define occ_by_other(i,dd,nn) ( live[OTHER(i)] && fdir[OTHER(i)]==(dd) && fname[OTHER(i)]==(nn) )
 #define notcur(i,dd,nn)       ( !(fdir[i]==(dd) && fname[i]==(nn)) )
 
-/* FIX vs BUGGY, isolated to two macros */
-#ifdef FIX
+/* per-entry exclusion: the flushing flag + the pending-count gate */
 #define EXCL_OK(o,i)   ( ((o) != RENAMEF && (o) != UNLINKF) || !flushing[i] )
 #define GATE(i)        ( pcount[i] == 0 && (fdir[i] != D || pcount[DIRX] == 0) )
-#else
-#define EXCL_OK(o,i)   ( true )
-#define GATE(i)        ( true )
-#endif
 
 /* apply one drained structural record to the backend (no lock held). a/b are SLOTs;
  * a slot's dir is slot/NN. A rename overwrites its target slot (POSIX replace). */
@@ -211,26 +205,17 @@ inline flush_one(i) {
 	atomic {                                       /* meta_flush_claim: snapshot, clear dirty */
 		dirty[i] && GATE(i) ->
 		sslot = SLOT(fdir[i],fname[i]); sv = ver[i]; sep = epoch[i]; dirty[i] = false;
-#ifdef FIX
 		flushing[i] = true;
-#endif
 	}
 	atomic {                                       /* the publish (rename(tmp,dst)), gated */
-#ifdef PUBLISH_GUARD
 		if
 		:: epoch[i] == sep ->                  /* entity still live & unreplaced */
 		   if :: (sslot/NN)==D -> assert(bdir) :: else -> skip fi;
 		   bpres[sslot] = true; bver[sslot] = sv
 		:: else -> skip                        /* superseded: dropped mid-flush, discard */
 		fi
-#else
-		if :: (sslot/NN)==D -> assert(bdir) :: else -> skip fi;
-		bpres[sslot] = true; bver[sslot] = sv
-#endif
 	}
-#ifdef FIX
 	flushing[i] = false;
-#endif
 }
 
 active proctype phase2() {

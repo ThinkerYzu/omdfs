@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Exhaustively verify the omdfs SPIN models. For each configuration it runs a full
-# state-space search and reports PASS (no error) or FOUND BUG. The buggy configs
-# are EXPECTED to fail; the fixed configs are EXPECTED to pass. `--check` exits
-# non-zero if any config deviates, so it can gate CI. `--quick` skips the largest
-# bounds.
+# state-space search and reports PASS (no error) or FOUND BUG. Every model is the
+# shipped (current) design, so all configurations are EXPECTED to pass. `--check`
+# exits non-zero if any config deviates, so it can gate CI. `--quick` skips the
+# largest bounds.
 #
 # Models:
 #   omdfs-flush.pml     focused clobber proof: pending_count gate + flushing flag.
@@ -58,72 +58,58 @@ echo "============================================================"
 
 echo
 echo "[1] omdfs-flush.pml -- clobber proof (gate + flushing flag)"
-echo "    property no_clobber; buggy MUST reach the clobber, fixed MUST be safe"
-run_cfg "buggy gate" bug  omdfs-flush.pml "-a -N no_clobber" -- -DSCENARIO=1
-run_cfg "buggy flag" bug  omdfs-flush.pml "-a -N no_clobber" -- -DSCENARIO=2
-run_cfg "fixed gate" pass omdfs-flush.pml "-a -N no_clobber" -- -DFIX -DSCENARIO=1
-run_cfg "fixed flag" pass omdfs-flush.pml "-a -N no_clobber" -- -DFIX -DSCENARIO=2
+echo "    property no_clobber holds in both workloads"
+run_cfg "scenario 1 (gate)" pass omdfs-flush.pml "-a -N no_clobber" -- -DSCENARIO=1
+run_cfg "scenario 2 (flag)" pass omdfs-flush.pml "-a -N no_clobber" -- -DSCENARIO=2
 
 echo
 echo "[2] omdfs-syncer.pml -- write-back engine over all op sequences"
-echo "    convergence: buggy MUST diverge, fixed MUST converge"
-run_cfg "buggy converge MAXOPS=3" bug  omdfs-syncer.pml "-a -N converge" -- -DMAXOPS=3
-run_cfg "fixed converge MAXOPS=3" pass omdfs-syncer.pml "-a -N converge" -- -DFIX -DMAXOPS=3
-run_cfg "fixed converge MAXOPS=4" pass omdfs-syncer.pml "-a -N converge" -- -DFIX -DMAXOPS=4
+echo "    convergence over every op sequence up to MAXOPS"
+run_cfg "converge MAXOPS=3" pass omdfs-syncer.pml "-a -N converge" -- -DMAXOPS=3
+run_cfg "converge MAXOPS=4" pass omdfs-syncer.pml "-a -N converge" -- -DMAXOPS=4
 if [ $QUICK = 0 ]; then
-	run_cfg "fixed converge MAXOPS=5" pass omdfs-syncer.pml "-a -N converge" -- -DFIX -DMAXOPS=5
+	run_cfg "converge MAXOPS=5" pass omdfs-syncer.pml "-a -N converge" -- -DMAXOPS=5
 fi
 echo "    ordering asserts + deadlock-freedom (no never-claim):"
-run_cfg "fixed safety  MAXOPS=4" pass omdfs-syncer.pml "" -- -DNOLTL -DFIX -DMAXOPS=4
+run_cfg "safety  MAXOPS=4" pass omdfs-syncer.pml "" -- -DNOLTL -DMAXOPS=4
 
 echo
 echo "[3] omdfs-recovery.pml -- crash recovery"
 echo "    1=suffix replay  2=stale-high clamp  3=dry-flush guard"
 for s in 1 2 3; do
-	run_cfg "buggy scenario $s" bug  omdfs-recovery.pml "" -- -DSCENARIO=$s
-	run_cfg "fixed scenario $s" pass omdfs-recovery.pml "" -- -DFIX -DSCENARIO=$s
+	run_cfg "scenario $s" pass omdfs-recovery.pml "" -- -DSCENARIO=$s
 done
 
 echo
 echo "[4] omdfs-impl.pml -- journal.c + meta.c + syncer.c + content.c, function by function"
 echo "    FULL file op-space incl. rename-ONTO-existing (replace); name decoupled from id."
-echo "    converge needs BOTH the exclusion (FIX) and the publish guard; buggy + FIX-only diverge."
-run_cfg "buggy live MAXOPS=4" bug  omdfs-impl.pml "-a -N converge" -- -DMAXOPS=4
-run_cfg "FIX only (replace gap)" bug omdfs-impl.pml "-a -N converge" -- -DFIX -DMAXOPS=4
-run_cfg "fixed live MAXOPS=3" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=3
-run_cfg "fixed live MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=4
+run_cfg "live MAXOPS=3" pass omdfs-impl.pml "-a -N converge" -- -DMAXOPS=3
+run_cfg "live MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DMAXOPS=4
 echo "    crash + remount (wal_init/sync_seed/recovery guard):"
-run_cfg "buggy crash MAXOPS=4" bug  omdfs-impl.pml "-a -N converge" -- -DCRASH -DMAXOPS=4
-run_cfg "fixed crash MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DCRASH -DMAXOPS=4
+run_cfg "crash MAXOPS=4" pass omdfs-impl.pml "-a -N converge" -- -DCRASH -DMAXOPS=4
 if [ $QUICK = 0 ]; then
-	run_cfg "fixed live MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=5
-	run_cfg "fixed crash MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DCRASH -DMAXOPS=5
+	run_cfg "live MAXOPS=5"  pass omdfs-impl.pml "-a -N converge" -- -DMAXOPS=5
+	run_cfg "crash MAXOPS=5" pass omdfs-impl.pml "-a -N converge" -- -DCRASH -DMAXOPS=5
 fi
 echo "    deadlock-freedom (no never-claim):"
-run_cfg "fixed safety MAXOPS=4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DPUBLISH_GUARD -DMAXOPS=4
-run_cfg "fixed safety crash M4" pass omdfs-impl.pml "" -- -DNOLTL -DFIX -DPUBLISH_GUARD -DCRASH -DMAXOPS=4
+run_cfg "safety MAXOPS=4"     pass omdfs-impl.pml "" -- -DNOLTL -DMAXOPS=4
+run_cfg "safety crash M4"     pass omdfs-impl.pml "" -- -DNOLTL -DCRASH -DMAXOPS=4
 
 echo
 echo "[5] omdfs-rename-replace.pml -- cross-identity replacing rename"
-echo "    a flush of the REPLACED entry must not clobber the survivor at the shared path"
-echo "    (the current per-entry exclusion alone does NOT cover it -- needs the publish guard)"
-run_cfg "buggy (no exclusion)"   bug  omdfs-rename-replace.pml "-a -N no_clobber" --
-run_cfg "current FIX only (gap)"  bug  omdfs-rename-replace.pml "-a -N no_clobber" -- -DFIX
-run_cfg "FIX + publish guard"    pass omdfs-rename-replace.pml "-a -N no_clobber" -- -DFIX -DPUBLISH_GUARD
+echo "    a flush of the REPLACED entry must not clobber the survivor (the publish guard)"
+run_cfg "no_clobber" pass omdfs-rename-replace.pml "-a -N no_clobber" --
 
 echo
 echo "[6] omdfs-replace.pml -- write-back engine over the FULL rename op-space (replace)"
 echo "    name decoupled from identity: the foreground can rename ONTO an existing entry."
-echo "    converge needs BOTH the exclusion AND the publish guard; buggy + FIX-only diverge."
-run_cfg "buggy (no exclusion)"     bug  omdfs-replace.pml "-a -N converge" -- -DMAXOPS=4
-run_cfg "FIX only (replace gap)"   bug  omdfs-replace.pml "-a -N converge" -- -DFIX -DMAXOPS=4
-run_cfg "fixed converge MAXOPS=4"  pass omdfs-replace.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=4
-run_cfg "fixed converge MAXOPS=5"  pass omdfs-replace.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=5
+run_cfg "converge MAXOPS=4" pass omdfs-replace.pml "-a -N converge" -- -DMAXOPS=4
+run_cfg "converge MAXOPS=5" pass omdfs-replace.pml "-a -N converge" -- -DMAXOPS=5
 if [ $QUICK = 0 ]; then
-	run_cfg "fixed converge MAXOPS=6" pass omdfs-replace.pml "-a -N converge" -- -DFIX -DPUBLISH_GUARD -DMAXOPS=6
+	run_cfg "converge MAXOPS=6" pass omdfs-replace.pml "-a -N converge" -- -DMAXOPS=6
 fi
 echo "    deadlock-freedom (no never-claim):"
-run_cfg "fixed safety MAXOPS=5" pass omdfs-replace.pml "" -- -DNOLTL -DFIX -DPUBLISH_GUARD -DMAXOPS=5
+run_cfg "safety MAXOPS=5" pass omdfs-replace.pml "" -- -DNOLTL -DMAXOPS=5
 
 echo
 rm -f pan pan.* _spin_nvr.tmp spin.err cc.err

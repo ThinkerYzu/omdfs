@@ -12,28 +12,25 @@
  * invariant `recovered` (backend == the cache truth):
  *
  *   SCENARIO 1  Replay only the un-applied SUFFIX.  WAL = create A / rename A->B /
- *               create A, all applied (checkpoint = 3). FIX replays records[3:]
- *               (nothing); the buggy variant replays the whole WAL and re-runs the
- *               rename over the recreated A -> B ends up holding the wrong file.
+ *               create A, all applied (checkpoint = 3). Recovery replays records[3:]
+ *               (nothing), so it never re-runs the rename over the recreated A. (Replaying
+ *               the whole WAL would re-run the rename and leave B holding the wrong file.)
  *
  *   SCENARIO 2  Interrupted-reclaim stale-HIGH checkpoint.  Reclaim truncates the
  *               WAL to empty then resets the checkpoint; a crash in between leaves
- *               {WAL empty, checkpoint = 3}. FIX clamps applied = min(ckpt, nrec) = 0
- *               and durably rewrites it, so a NEW op appended after recovery (at
- *               position 0) is >= applied and drains. The buggy variant trusts the
- *               stale-high checkpoint, counts the new op as already-applied, and
- *               never drains it -> a silently lost mutation.
+ *               {WAL empty, checkpoint = 3}. Recovery clamps applied = min(ckpt, nrec) = 0
+ *               and durably rewrites it, so a NEW op appended after recovery (at position 0)
+ *               is >= applied and drains. (Trusting the stale-high checkpoint would mis-count
+ *               the new op as already-applied and never drain it -- a silently lost mutation.)
  *
  *   SCENARIO 3  The dry-flush guard.  A recovered, un-applied rename A->B sits in
  *               the WAL while B is dirty (new bytes in the cache). Post-crash all
  *               pending_counts are 0, so the normal gate can't tell the rename is
- *               undrained. FIX holds real flushing until the recovered WAL has
- *               drained once (s_initial_drained); the buggy variant lets phase 2
- *               flush B before phase 1 drains the rename, and the rename then
- *               clobbers the freshly-flushed bytes -- the recovery-time clobber.
+ *               undrained. Recovery holds real flushing until the recovered WAL has
+ *               drained once (s_initial_drained). (Flushing B before phase 1 drains the
+ *               rename would let the rename clobber the freshly-flushed bytes.)
  *
- * Switch: -DFIX selects the correct recovery; without it, the historical hazard.
- *         -DSCENARIO=1|2|3 (default 1).
+ * Switch: -DSCENARIO=1|2|3 (default 1).
  */
 
 #ifndef SCENARIO
@@ -93,15 +90,8 @@ init {
 #endif
 
 	/* wal_init: clamp a stale-high checkpoint down to the records on disk */
-#ifdef FIX
 	if :: ckpt > nrec -> ckpt = nrec :: else -> skip fi;   /* clamp + (durable) rewrite */
 	start = ckpt;
-#else
-	start = ckpt;                                          /* SCN2 buggy: trust stale-high */
-  #if SCENARIO == 1
-	start = 0;                                             /* SCN1 buggy: replay whole WAL */
-  #endif
-#endif
 
 	/* replay records[start:] */
 	k = start;
@@ -150,12 +140,8 @@ proctype rec_phase1() {
 proctype rec_phase2() {
 	byte sv;
 	if
-#ifdef FIX
 	:: atomic { fl_dirty && rec_drained ->   /* dry until recovery drained; then claim */
 	            sv = fl_tag; fl_dirty = false }
-#else
-	:: atomic { fl_dirty -> sv = fl_tag; fl_dirty = false }   /* flush immediately */
-#endif
 	   bpres[B] = true; btag[B] = sv          /* the push (off-lock) */
 	:: !fl_dirty -> skip
 	fi;

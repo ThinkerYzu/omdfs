@@ -26,12 +26,9 @@
  *   So the flush's rename(tmp,Q) and phase 1's rename(P,Q) are never live at once.
  *
  * Build-time switches (pass with `spin -D...` / `-D...` to the C compiler):
- *   FIX           -- if defined, model the fixed syncer (gate + flushing flag).
- *                    if undefined, model the buggy pre-session-25 syncer.
- *   SCENARIO=1    -- documented clobber: write then rename (exercises the gate).
- *   SCENARIO=2    -- overlapping-phase clobber: an already-dirty, settled entry
- *                    whose flush can start before a fresh rename arrives
- *                    (exercises the flushing flag, Change 3).
+ *   SCENARIO=1    -- write then rename (exercises the gate).
+ *   SCENARIO=2    -- an already-dirty, settled entry whose flush can start before a
+ *                    fresh rename arrives (exercises the flushing flag).
  *
  * Correctness property (safety): at quiescence the backend at the entry's current
  * path equals its cached bytes -- no flush was silently undone.  See `no_clobber`.
@@ -72,16 +69,10 @@ byte ren_from, ren_to;
 /* per-process completion flags, for the quiescence predicate */
 bool fg_done, p1_done, p2_done;
 
-/* FIX vs BUGGY differences, isolated to two macros */
-#ifdef FIX
+/* the per-entry exclusion, isolated to three macros */
 #define CAN_DRAIN (wal_pending && !flushing)   /* phase 1 defers while flushing  */
 #define DEC_COUNT pcount--                     /* drained op releases its count  */
 #define FLUSH_GATE (dirty && pcount == 0)      /* flush only on the settled edge */
-#else
-#define CAN_DRAIN (wal_pending)                /* buggy: no exclusion            */
-#define DEC_COUNT skip
-#define FLUSH_GATE (dirty)                     /* buggy: flush on the dirty flag */
-#endif
 
 /* ---- foreground (the FUSE mutator) ------------------------------------- */
 proctype foreground()
@@ -90,13 +81,11 @@ proctype foreground()
 	/* content write: arms the dirty flag, no WAL record (Decision 4) */
 	atomic { cache = V2; dirty = true; }
 #endif
-	/* rename P -> Q: meta_move_entry rekeys (FIX pre-bumps the count under the
+	/* rename P -> Q: meta_move_entry rekeys (pre-bumps the count under the
 	 * move's own lock), then wal_append records the structural op. */
 	atomic {
 		cur_path = Q;
-#ifdef FIX
 		pcount++;
-#endif
 	}
 	atomic { wal_pending = true; ren_from = P; ren_to = Q; }
 	fg_done = true;
@@ -124,22 +113,18 @@ proctype phase2()
 {
 	byte snap_path, snap_content;
 
-	/* meta_flush_claim: snapshot the path+bytes, clear dirty, (FIX) set flushing,
+	/* meta_flush_claim: snapshot the path+bytes, clear dirty, set flushing,
 	 * all atomically under meta_mtx.  The gate decides when a claim may happen. */
 	atomic {
 		FLUSH_GATE ->
 		snap_path = cur_path;
 		snap_content = cache;
 		dirty = false;
-#ifdef FIX
 		flushing = true;
-#endif
 	}
 	/* the push -- backend copy + publish, with NO lock held across the I/O */
 	backend[snap_path] = snap_content;
-#ifdef FIX
 	flushing = false;        /* meta_flush_release */
-#endif
 	p2_done = true;
 }
 

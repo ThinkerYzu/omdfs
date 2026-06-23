@@ -28,10 +28,10 @@
  *   FLUSHING_DEFER defers a rename/unlink of a flushing entry -- but it checks the
  *   *renamed* entity (A), which is not the one flushing. B (the destination being
  *   replaced) is flushing, and nothing defers the rename ONTO a flushing entry's path.
- *   So with the current exclusion (FIX) the clobber is still reachable.
+ *   So with the per-entry exclusion alone the clobber is still reachable.
  *
- * The fix (PUBLISH_GUARD) -- as shipped, "validate at publish"
- * ------------------------------------------------------------
+ * The publish guard -- as shipped, "validate at publish"
+ * ------------------------------------------------------
  *   The flush's publish is made atomic, under meta_mtx, with a check that the flushing
  *   entry is still live (its indirection not detached by the replace's ind_release). A
  *   superseded flush -- one whose entry was replaced/removed mid-flush -- is discarded
@@ -44,11 +44,11 @@
  *   detaches B, by the time B's publish could win the race B is already detached -- so the
  *   locked check discards it.
  *
- * Switches:
- *   FIX            model the current per-entry exclusion (gate + flushing-defer on the
- *                  renamed entity). Without it, the buggy pre-exclusion syncer.
- *   PUBLISH_GUARD  the shipped fix: publish a flush only if its entry is still live
- *                  (meta_flush_publish), atomic with the replace. Implies FIX.
+ * The model is the shipped design: per-entry exclusion (gate + flushing-defer on the
+ * renamed entity) AND the publish guard (publish a flush only if its entry is still live,
+ * meta_flush_publish, atomic with the replace). Exclusion alone is vacuous here -- it
+ * defers on the renamed entity A, not the flushing destination B -- so the publish guard
+ * is what closes the cross-identity clobber.
  *
  * Property (safety): at quiescence the backend at A's current path holds A's bytes --
  * B's discarded flush never clobbers the survivor. See `no_clobber`.
@@ -88,36 +88,26 @@ byte ren_from, ren_to;
 
 bool fg_done, p1_done, p2_done;
 
-/* FIX: the current per-entry exclusion. The rename defers only while the RENAMED
- * entity (A) is flushing -- vacuous here, since B is the one flushing. */
-#ifdef FIX
+/* per-entry exclusion: the rename defers only while the RENAMED entity (A) is flushing --
+ * vacuous here, since B is the one flushing. This is why exclusion alone cannot cover the
+ * replace, and why the publish guard below is needed. */
 #define DRAIN_DEFER (a_flushing)
 #define DEC_A       a_pcount--
-#else
-#define DRAIN_DEFER (false)
-#define DEC_A       skip
-#endif
 
-/* PUBLISH_GUARD: the shipped fix -- a flush publishes only if its entry is still live
- * (not dropped by the replace). The check + publish are atomic (meta_flush_publish under
+/* the publish guard (shipped) -- a flush publishes only if its entry is still live (not
+ * dropped by the replace). The check + publish are atomic (meta_flush_publish under
  * meta_mtx). PUBLISH_OK is evaluated inside that atomic in phase 2. */
-#ifdef PUBLISH_GUARD
 #define PUBLISH_OK (!b_gone)
-#else
-#define PUBLISH_OK (true)
-#endif
 
 /* ---- foreground: rename A -> P, replacing B --------------------------------- */
 proctype foreground()
 {
-	/* meta_move_entry under meta_mtx: rekey A to P (FIX pre-bumps A's count) and
+	/* meta_move_entry under meta_mtx: rekey A to P (pre-bumps A's count) and
 	 * drop B. B's ind is detached; a flush already holding it (b_flushing) lingers
 	 * and its copy is still in flight -- the danger. */
 	atomic {
 		a_path = P;
-#ifdef FIX
 		a_pcount++;
-#endif
 		b_gone = true;
 		b_dirty = false;   /* B's dirty content is discarded by the replace */
 	}

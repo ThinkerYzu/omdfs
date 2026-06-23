@@ -32,17 +32,16 @@
  *               rename), so reads stay warm and correct across a rename-onto-existing.
  *               (open_backend_for_fetch's cold-fetch retry is therefore not exercised by
  *               a FILE rename -- its real trigger is a DIRECTORY rename moving an evicted
- *               child with no prefetch, which is out of scope here; -DNOREADFIX is a
- *               no-op until directory rename is modeled.)
+ *               child with no prefetch, which is out of scope here.)
  *   + SPIN invalid-end-state => no deadlock.
  *
- * The fix has TWO parts (the shipped fix is FIX + PUBLISH_GUARD):
- *   FIX          per-entry exclusion: the flush gate (entry + ancestor dir pcount==0),
- *                FLUSHING_DEFER (phase 1 defers a rename/unlink of a *flushing* entity),
- *                and the s_initial_drained recovery guard. Handles SAME-entity races.
- *                Does NOT cover replace: a replacing rename is logged on the SOURCE, the
- *                dropped destination is never deferred, so its in-flight flush clobbers.
- *   PUBLISH_GUARD validate-at-publish: copy_file publishes only if the entity has not been
+ * The shipped design has TWO cooperating mechanisms:
+ *   per-entry exclusion  the flush gate (entry + ancestor dir pcount==0), FLUSHING_DEFER
+ *                (phase 1 defers a rename/unlink of a *flushing* entity), and the
+ *                s_initial_drained recovery guard. Handles SAME-entity races. Alone it
+ *                does NOT cover replace: a replacing rename is logged on the SOURCE, the
+ *                dropped destination is never deferred, so its in-flight flush would clobber.
+ *   publish guard validate-at-publish: copy_file publishes only if the entity has not been
  *                dropped (replaced/unlinked) since the claim -- meta_flush_publish() /
  *                meta_flush_attr_begin() in the C. Modeled by an epoch the flush snapshots
  *                at claim and re-checks at publish (the static ind table can't carry a
@@ -58,8 +57,7 @@
  * RENAME and deep nesting (a renamed parent transitively remapping a subtree's paths)
  * are a further stage -- here d is a fixed optional subdir.
  *
- * Switches: -DFIX, -DPUBLISH_GUARD, -DCRASH, -DMAXOPS=n (default 3), -DNOLTL,
- *           -DNOREADFIX (drop open_backend_for_fetch's retry -> breaks readok).
+ * Switches: -DCRASH, -DMAXOPS=n (default 3), -DNOLTL (deadlock/assert).
  */
 
 #ifndef MAXOPS
@@ -163,22 +161,14 @@ bool crash_used;
  * and (if it lives under d) d has none either. */
 #define flushable_locked(i) ( inds[i].pending_count==0 && (idx[i].dir!=D || inds[DIRX].pending_count==0) )
 
-#ifdef FIX
+/* per-entry exclusion: defer a rename/unlink of a flushing entry, gate the flush claim,
+ * and hold the flush until the recovery WAL has drained. */
 #define FLUSHING_DEFER(op,id) ( ((op)==RENAMEF || (op)==UNLINKF) && inds[id].flushing )
 #define CLAIM_GATE(i)         flushable_locked(i)
 #define INITIAL_DRAINED       ( s_q_drained >= s_recovery_target )
-#else
-#define FLUSHING_DEFER(op,id) ( false )
-#define CLAIM_GATE(i)         ( true )      /* pre-fix: meta_flush_claim ignored the gate */
-#define INITIAL_DRAINED       ( true )
-#endif
 
 /* open_backend_for_fetch's retry over a not-yet-drained rename (content.c). */
-#ifdef NOREADFIX
-#define READ_RETRY ( false )
-#else
 #define READ_RETRY ( true )
-#endif
 
 /* evictable: evict.c reclaims only a clean file whose CURRENT content is already durable
  * on the backend at its current path (no structural op in flight). */
@@ -235,18 +225,12 @@ inline meta_flush_claim(i) {
 	atomic {
 		idx[i].dirty && INITIAL_DRAINED && CLAIM_GATE(i) ->
 		sp = idx[i].dir; sn = idx[i].name; sv = idx[i].ver; sep = epoch[i]; idx[i].dirty = false;
-#ifdef FIX
 		inds[i].flushing = true;
-#endif
 	}
 }
 
 inline meta_flush_release(i) {
-#ifdef FIX
 	inds[i].flushing = false;
-#else
-	skip
-#endif
 }
 
 /* ============================== syncer.c (queue) ============================ */
@@ -326,11 +310,10 @@ inline phase_structural() {
 /* ============================== syncer.c (flush) =========================== */
 
 /* copy_file: write the snapshot bytes to the backend at the snapshot path slot, off the
- * lock. PUBLISH_GUARD makes the publish atomic with a check that the entity wasn't
- * dropped since the claim (epoch unchanged) -- meta_flush_publish: a superseded flush
- * (its entity replaced/unlinked mid-flush) discards instead of clobbering the successor. */
+ * lock. The publish is atomic with a check that the entity wasn't dropped since the claim
+ * (epoch unchanged) -- meta_flush_publish: a superseded flush (its entity replaced/unlinked
+ * mid-flush) discards instead of clobbering the successor. */
 inline copy_file(i) {
-#ifdef PUBLISH_GUARD
 	atomic {
 		if
 		:: epoch[i] == sep ->
@@ -341,12 +324,6 @@ inline copy_file(i) {
 		:: else -> skip                               /* superseded: discard */
 		fi
 	}
-#else
-#ifndef CRASH
-	if :: sp == D -> assert(bdir) :: else -> skip fi;
-#endif
-	bpres[SLOT(sp,sn)] = true; bver[SLOT(sp,sn)] = sv
-#endif
 }
 
 /* flush_entry: meta_flush_claim -> copy_file (off the lock) -> meta_flush_release. */
