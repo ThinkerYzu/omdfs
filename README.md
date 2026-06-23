@@ -210,8 +210,6 @@ the shipped design; all configurations are expected to pass. Needs `spin` (teste
 - `omdfs-replace.pml` — the write-back engine over the **full rename op-space** (name
   decoupled from identity, so *rename-onto-existing* is generated) over every op sequence.
 
-See the writeup in `proj_docs/omdfs/SPIN-VERIFICATION.md`.
-
 ## Limitations
 
 - **Single writer only.** Concurrent writes from other clients are unsupported
