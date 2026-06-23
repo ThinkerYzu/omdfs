@@ -235,4 +235,4 @@ Early development. Roadmap:
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).
